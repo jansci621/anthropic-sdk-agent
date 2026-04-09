@@ -61,6 +61,7 @@ class ReActTrace:
     query: str
     steps: list[ReActStep] = field(default_factory=list)
     final_answer: str = ""
+    final_content: list = field(default_factory=list)  # raw content blocks from last message
     total_turns: int = 0
     success: bool = False
 
@@ -176,6 +177,7 @@ class ReActLoop:
                 step.is_final = True
                 trace.steps.append(step)
                 trace.final_answer = step.final_answer
+                trace.final_content = list(message.content)  # preserve all blocks including thinking
                 trace.total_turns = step_num
                 trace.success = True
                 self._print_final_answer(step.final_answer)

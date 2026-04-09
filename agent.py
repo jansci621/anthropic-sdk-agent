@@ -476,10 +476,11 @@ class Agent:
 
         # Append to shared conversation so the user can follow up naturally
         self.conversation.append({"role": "user", "content": query})
-        self.conversation.append({
-            "role": "assistant",
-            "content": answer or "[no answer]",
-        })
+        # Use raw content blocks (preserves thinking) when available, fallback to answer string
+        if trace.final_content:
+            self.conversation.append({"role": "assistant", "content": trace.final_content})
+        else:
+            self.conversation.append({"role": "assistant", "content": answer or "[no answer]"})
 
         print(
             f"\n{config.COLOR_SYSTEM}[ReAct] Completed in {trace.total_turns} step(s).{config.COLOR_RESET}\n"
