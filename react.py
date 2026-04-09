@@ -125,6 +125,7 @@ class ReActLoop:
         self.thinking_config = thinking_config
         self.max_tokens = max_tokens
         self.event_bus = event_bus
+        self._current_block_type: str | None = None
 
     def _emit(self, event_type: str, data: dict | None = None):
         """Emit an event through the event bus (if configured)."""
@@ -174,6 +175,31 @@ class ReActLoop:
                 for block in message.content:
                     if block.type == "text":
                         step.final_answer += block.text
+
+                # Empty response: model returned end_turn with no text.
+                # This can happen when a non-Claude model writes pseudo tool calls
+                # inside thinking blocks instead of making actual tool_use blocks.
+                # Nudge the model to respond properly and retry this step.
+                if not step.final_answer.strip():
+                    print(
+                        f"\n{config.COLOR_SYSTEM}[ReAct] Step {step_num}: empty response, "
+                        f"nudging model to retry...{config.COLOR_RESET}"
+                    )
+                    # Remove the empty assistant turn we just appended
+                    messages.pop()
+                    # Add a nudge and let the loop continue
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SYSTEM] Your previous response was empty. "
+                            "You MUST respond with actual text content or use a tool. "
+                            "Do NOT write tool calls inside thinking blocks — "
+                            "use actual tool invocations instead. "
+                            "Now please answer the original question."
+                        ),
+                    })
+                    continue
+
                 step.is_final = True
                 trace.steps.append(step)
                 trace.final_answer = step.final_answer
@@ -304,6 +330,7 @@ class ReActLoop:
         """Route stream events to their correct ReAct phase output."""
         if event.type == "content_block_start":
             block = event.content_block
+            self._current_block_type = block.type
             if block.type == "thinking":
                 self._emit(EVENT_REACT_STEP_START, {"step_num": step.step_num})
                 self._emit(EVENT_THINKING_START)
@@ -324,6 +351,15 @@ class ReActLoop:
                 self._emit(EVENT_TEXT_DELTA, {"text": delta.text})
             elif delta.type == "input_json_delta":
                 self._emit(EVENT_TOOL_CALL_DELTA, {"partial_json": delta.partial_json})
+
+        elif event.type == "content_block_stop":
+            if self._current_block_type == "thinking":
+                self._emit(EVENT_THINKING_END)
+            elif self._current_block_type == "text":
+                self._emit(EVENT_TEXT_END)
+            elif self._current_block_type == "tool_use":
+                self._emit(EVENT_TOOL_CALL_END)
+            self._current_block_type = None
 
         elif event.type == "content_block_stop":
             pass  # _end events emitted by CLIPrintSink or handled by caller

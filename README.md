@@ -294,14 +294,101 @@ AI_PROVIDER=together
 TOGETHER_API_KEY=xxx
 ```
 
-### 自定义端点
+### 自定义端点（Custom）
+
+适用于任何 OpenAI/Anthropic 兼容的 API 服务（如 vLLM、Ollama、LocalAI、One API 等）：
 
 ```env
 AI_PROVIDER=custom
-AI_BASE_URL=https://your-api.example.com
+AI_BASE_URL=https://your-api.example.com/v1
 AI_API_KEY=xxx
 AI_MODEL=your-model-name
 ```
+
+通过环境变量传入：
+
+```bash
+export AI_PROVIDER=custom
+export AI_BASE_URL=https://your-api.example.com/v1
+export AI_API_KEY=your-key
+export AI_MODEL=your-model-name
+python main.py --web
+```
+
+## Docker 部署
+
+基于 CentOS 7，使用阿里云镜像源构建。
+
+### 构建镜像
+
+```bash
+docker build -t anthropic-sdk-agent .
+```
+
+### 运行
+
+**使用 Anthropic 官方 API：**
+
+```bash
+docker run -d -p 8000:8000 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/knowledge_base:/app/knowledge_base \
+  -e ANTHROPIC_API_KEY=sk-ant-xxx \
+  anthropic-sdk-agent
+```
+
+**使用自定义端点（Custom Provider）：**
+
+```bash
+docker run -d -p 8000:8000 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/knowledge_base:/app/knowledge_base \
+  -e AI_PROVIDER=custom \
+  -e AI_BASE_URL=https://your-api.example.com/v1 \
+  -e AI_API_KEY=your-key \
+  -e AI_MODEL=your-model-name \
+  anthropic-sdk-agent
+```
+
+**使用 .env 文件：**
+
+```bash
+docker run -d -p 8000:8000 \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/knowledge_base:/app/knowledge_base \
+  --env-file .env \
+  anthropic-sdk-agent
+```
+
+**CLI 模式（交互式）：**
+
+```bash
+docker run -it --rm \
+  -v $(pwd)/data:/app/data \
+  -e ANTHROPIC_API_KEY=sk-ant-xxx \
+  anthropic-sdk-agent \
+  python3 main.py
+```
+
+### 环境变量说明
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| `AI_PROVIDER` | 否 | 服务商，默认 `anthropic`；自定义端点设为 `custom` |
+| `AI_BASE_URL` | custom 时必填 | 自定义 API 端点地址 |
+| `AI_API_KEY` | 是 | API Key（也可用 Provider 专属变量如 `ANTHROPIC_API_KEY`） |
+| `AI_MODEL` | custom 时必填 | 模型名称 |
+| `AI_THINKING` | 否 | 是否启用 thinking，默认 `true` |
+| `AI_MAX_TOKENS` | 否 | 最大输出 token，默认 `128000` |
+| `HF_ENDPOINT` | 否 | HuggingFace 镜像，国内可设为 `https://hf-mirror.com` |
+
+### 挂载目录
+
+| 路径 | 说明 |
+|------|------|
+| `/app/data` | 运行时数据（记忆、经验、统计等） |
+| `/app/knowledge_base` | RAG 知识库文档 |
+| `/app/skills` | 技能插件目录 |
 
 ## License
 
