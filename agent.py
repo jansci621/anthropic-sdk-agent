@@ -649,6 +649,23 @@ class Agent:
 
     # ── Streaming ────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _strip_thinking_for_api(messages: list) -> list:
+        """Strip thinking blocks from messages for API calls (proxy compatibility).
+        Returns a shallow copy; does not modify the original."""
+        cleaned = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                filtered = [b for b in content if not (isinstance(b, dict) and b.get("type") == "thinking")]
+                if filtered != content:
+                    cleaned.append({**msg, "content": filtered})
+                else:
+                    cleaned.append(msg)
+            else:
+                cleaned.append(msg)
+        return cleaned
+
     _MAX_CONVERSATION_PAIRS = 40  # keep last N user/assistant pairs
 
     def _stream_response(self, max_retries: int = 10) -> anthropic.types.Message:
@@ -709,7 +726,12 @@ class Agent:
                         })
                         healed = True
                     if healed:
-                        stream_kwargs["messages"] = self.conversation
+                        # Strip thinking blocks from messages for API when thinking is disabled,
+                        # but keep them in self.conversation for session history display
+                        if "thinking" not in stream_kwargs:
+                            stream_kwargs["messages"] = self._strip_thinking_for_api(self.conversation)
+                        else:
+                            stream_kwargs["messages"] = self.conversation
                         self._emit(EVENT_STATUS, {
                             "message": f"  [Self-heal] Fixed messages (code {error_code}), retrying..."
                         })
@@ -833,10 +855,9 @@ class Agent:
                     else:
                         new_blocks.append(block)
 
-                # Strip thinking blocks — some proxies don't support them
+                # Keep thinking blocks for session history display
                 elif btype == "thinking":
-                    fixed = True
-                    continue
+                    new_blocks.append(block)
 
                 # Keep tool_use etc. as-is
                 else:

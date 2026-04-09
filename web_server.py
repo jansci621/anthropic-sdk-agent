@@ -357,6 +357,10 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
     queue: asyncio.Queue = asyncio.Queue()
     sink = AsyncQueueSink(queue)
+    # Remove stale AsyncQueueSinks from previous WS connections
+    # (prevents ghost events from leaking across sessions)
+    with bus._lock:
+        bus._sinks = [s for s in bus._sinks if not isinstance(s, AsyncQueueSink)]
     bus.add_sink(sink)
 
     try:
@@ -385,11 +389,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             # Handle reset
             if data.get("type") == "reset":
                 async with _agent_run_lock:
-                    agent.conversation.clear()
-                    agent._consecutive_errors = 0
-                    agent._error_budget.clear()
-                    bus.emit(EVENT_SYSTEM, {"message": "Conversation reset."})
-                    _save_session(session_id, agent.conversation)
+                    sink.active = True
+                    try:
+                        agent.conversation.clear()
+                        agent._consecutive_errors = 0
+                        agent._error_budget.clear()
+                        bus.emit(EVENT_SYSTEM, {"message": "Conversation reset."})
+                        _save_session(session_id, agent.conversation)
+                    finally:
+                        sink.active = False
                 continue
 
             user_message = data.get("message", "").strip()
@@ -402,68 +410,74 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             # ── Run agent under lock (prevents concurrent executor on shared agent) ──
             async with _agent_run_lock:
-                # Restore this session's conversation into the shared agent
-                agent.conversation = list(session.get("_conv_snapshot", []))
-                agent._workspace_dir = _get_workspace(session_id)
+                # Activate only THIS session's sink — prevents event leaking
+                sink.active = True
 
-                # Natural language skill matching
-                skill_match = agent._match_skill_natural(user_message)
-                if skill_match:
-                    skill_name, args = skill_match
-                    bus.emit(EVENT_SYSTEM, {"message": f"[Skill → {skill_name}]"})
-                    await loop.run_in_executor(None, agent._trigger_skill, skill_name, args)
-                    bus.emit(EVENT_SYSTEM, {"message": ""})
+                try:
+                    # Restore this session's conversation into the shared agent
+                    agent.conversation = list(session.get("_conv_snapshot", []))
+                    agent._workspace_dir = _get_workspace(session_id)
+
+                    # Natural language skill matching
+                    skill_match = agent._match_skill_natural(user_message)
+                    if skill_match:
+                        skill_name, args = skill_match
+                        bus.emit(EVENT_SYSTEM, {"message": f"[Skill → {skill_name}]"})
+                        await loop.run_in_executor(None, agent._trigger_skill, skill_name, args)
+                        bus.emit(EVENT_SYSTEM, {"message": ""})
+                        try:
+                            conv_copy = list(agent.conversation)
+                            _save_session(session_id, conv_copy)
+                            session["_conv_snapshot"] = conv_copy
+                        except Exception:
+                            pass
+                        continue
+
+                    # Append user message to conversation (no save yet)
+                    agent.conversation.append({"role": "user", "content": user_message})
+
+                    use_react = mode == "react"
+                    if mode == "react":
+                        agent.conversation.pop()
+                        bus.emit(EVENT_SYSTEM, {"message": f"[Mode: ReAct]"})
+                    elif mode == "agent":
+                        pass
+                    else:
+                        if agent.router and config.AUTO_ROUTE:
+                            from router import RouteDecision
+                            decision = agent.router.route(user_message, len(agent.conversation))
+                            if decision.mode == "react":
+                                use_react = True
+                                agent.conversation.pop()
+                                bus.emit(EVENT_SYSTEM, {
+                                    "message": f"[Router -> ReAct] {decision.reason}"
+                                })
+
+                    # Agent is about to start — create session file now
                     try:
                         conv_copy = list(agent.conversation)
                         _save_session(session_id, conv_copy)
                         session["_conv_snapshot"] = conv_copy
                     except Exception:
                         pass
-                    continue
 
-                # Append user message to conversation (no save yet)
-                agent.conversation.append({"role": "user", "content": user_message})
+                    # Run agent (only one at a time — lock guarantees this)
+                    if use_react:
+                        await loop.run_in_executor(None, agent._run_react, user_message)
+                    else:
+                        await loop.run_in_executor(None, agent._agent_loop)
+                    bus.emit(EVENT_SYSTEM, {"message": ""})
 
-                use_react = mode == "react"
-                if mode == "react":
-                    agent.conversation.pop()
-                    bus.emit(EVENT_SYSTEM, {"message": f"[Mode: ReAct]"})
-                elif mode == "agent":
-                    pass
-                else:
-                    if agent.router and config.AUTO_ROUTE:
-                        from router import RouteDecision
-                        decision = agent.router.route(user_message, len(agent.conversation))
-                        if decision.mode == "react":
-                            use_react = True
-                            agent.conversation.pop()
-                            bus.emit(EVENT_SYSTEM, {
-                                "message": f"[Router -> ReAct] {decision.reason}"
-                            })
-
-                # Agent is about to start — create session file now
-                try:
-                    conv_copy = list(agent.conversation)
-                    _save_session(session_id, conv_copy)
-                    session["_conv_snapshot"] = conv_copy
-                except Exception:
-                    pass
-
-                # Run agent (only one at a time — lock guarantees this)
-                if use_react:
-                    await loop.run_in_executor(None, agent._run_react, user_message)
-                else:
-                    await loop.run_in_executor(None, agent._agent_loop)
-                bus.emit(EVENT_SYSTEM, {"message": ""})
-
-                # Save after agent turn
-                try:
-                    conv_copy = list(agent.conversation)
-                    _save_session(session_id, conv_copy)
-                    session["_conv_snapshot"] = conv_copy
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
+                    # Save after agent turn
+                    try:
+                        conv_copy = list(agent.conversation)
+                        _save_session(session_id, conv_copy)
+                        session["_conv_snapshot"] = conv_copy
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                finally:
+                    sink.active = False
 
     except WebSocketDisconnect:
         pass

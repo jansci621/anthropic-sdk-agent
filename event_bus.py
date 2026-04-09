@@ -142,12 +142,19 @@ class AsyncQueueSink:
 
     Used by web_server to forward agent events to a WebSocket.
     Thread-safe: asyncio.Queue.put_nowait() is safe from any thread.
+
+    The ``active`` flag controls whether events are forwarded.
+    Only the WebSocket handler that currently holds the agent run lock
+    sets active=True, preventing events from leaking across sessions.
     """
 
     def __init__(self, queue: asyncio.Queue):
         self._queue = queue
+        self.active: bool = False
 
     def __call__(self, event_type: str, data: dict):
+        if not self.active:
+            return  # drop events when this sink's session isn't running
         message = json.dumps({"type": event_type, **data}, ensure_ascii=False)
         try:
             self._queue.put_nowait(message)
