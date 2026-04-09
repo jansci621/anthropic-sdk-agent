@@ -97,8 +97,8 @@ class ReActLoop:
     before the next model call.
     """
 
-    MAX_STEPS = 20
-    _MAX_RETRIES = 3
+    MAX_STEPS = 30
+    _MAX_RETRIES = 5
 
     def __init__(
         self,
@@ -264,6 +264,17 @@ class ReActLoop:
                 wait = 2 ** attempt * 1.5
                 print(
                     f"\n{config.COLOR_SYSTEM}[ReAct] API busy, retry {attempt + 1} in {wait:.0f}s...{config.COLOR_RESET}",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+            except (anthropic.APIConnectionError, ConnectionError, OSError) as exc:
+                if attempt == self._MAX_RETRIES:
+                    raise
+                wait = 2 ** attempt * 1.5
+                print(
+                    f"\n{config.COLOR_SYSTEM}[ReAct] Network error ({type(exc).__name__}), "
+                    f"retry {attempt + 1} in {wait:.0f}s...{config.COLOR_RESET}",
                     flush=True,
                 )
                 time.sleep(wait)

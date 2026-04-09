@@ -18,6 +18,7 @@ Rule schema:
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
 
 import config
@@ -36,6 +37,7 @@ class FastRuleEngine:
     def __init__(self, filepath: str = _RULES_FILE):
         self.filepath = filepath
         self._data = self._load()
+        self._lock = threading.Lock()
 
     # ── Fast Path ─────────────────────────────────────────────────────────
 
@@ -45,21 +47,22 @@ class FastRuleEngine:
         Both the stored pattern and the incoming error are normalised consistently
         so that path names, numbers, and casing don't prevent matches.
         """
-        norm_error = _normalise(error_msg)   # match on normalised form, same as stored
-        for rule in self._data["rules"]:
-            if not rule.get("promoted"):
-                continue
-            if rule.get("tool_name") not in ("*", tool_name):
-                continue
-            try:
-                if re.search(rule["pattern"], norm_error, re.IGNORECASE):
-                    rule["hit_count"] = rule.get("hit_count", 0) + 1
-                    rule["last_matched"] = _now()
-                    self._flush()
-                    return f"[FastRule] {rule['fix_template']}"
-            except re.error:
-                continue
-        return None
+        with self._lock:
+            norm_error = _normalise(error_msg)   # match on normalised form, same as stored
+            for rule in self._data["rules"]:
+                if not rule.get("promoted"):
+                    continue
+                if rule.get("tool_name") not in ("*", tool_name):
+                    continue
+                try:
+                    if re.search(rule["pattern"], norm_error, re.IGNORECASE):
+                        rule["hit_count"] = rule.get("hit_count", 0) + 1
+                        rule["last_matched"] = _now()
+                        self._flush()
+                        return f"[FastRule] {rule['fix_template']}"
+                except re.error:
+                    continue
+            return None
 
     # ── Slow Path ─────────────────────────────────────────────────────────
 
@@ -70,47 +73,48 @@ class FastRuleEngine:
         fix_strategy: str,
         success: bool,
     ):
-        """Record a Slow Path repair outcome and potentially promote to Fast Path."""
-        norm = _normalise(error_msg)
+        """Record a Slow Path repair outcome and potentially promote to Fast Path (thread-safe)."""
+        with self._lock:
+            norm = _normalise(error_msg)
 
-        # Find or create a rule for this pattern
-        for rule in self._data["rules"]:
-            if rule["norm_pattern"] == norm and rule.get("tool_name") in ("*", tool_name):
-                n = rule.get("hit_count", 0)
-                rule["success_rate"] = (rule.get("success_rate", 0) * n + int(success)) / (n + 1)
-                rule["hit_count"] = n + 1
-                rule["last_matched"] = _now()
-                if success and not rule.get("promoted") and rule["hit_count"] >= PROMOTE_THRESHOLD:
-                    rule["promoted"] = True
-                    print(
-                        f"  {config.COLOR_SYSTEM}[FastRule] Promoted rule for: "
-                        f"{norm[:60]}...{config.COLOR_RESET}",
-                        flush=True,
-                    )
-                self._flush()
-                return
+            # Find or create a rule for this pattern
+            for rule in self._data["rules"]:
+                if rule["norm_pattern"] == norm and rule.get("tool_name") in ("*", tool_name):
+                    n = rule.get("hit_count", 0)
+                    rule["success_rate"] = (rule.get("success_rate", 0) * n + int(success)) / (n + 1)
+                    rule["hit_count"] = n + 1
+                    rule["last_matched"] = _now()
+                    if success and not rule.get("promoted") and rule["hit_count"] >= PROMOTE_THRESHOLD:
+                        rule["promoted"] = True
+                        print(
+                            f"  {config.COLOR_SYSTEM}[FastRule] Promoted rule for: "
+                            f"{norm[:60]}...{config.COLOR_RESET}",
+                            flush=True,
+                        )
+                    self._flush()
+                    return
 
-        # New rule — start in Slow Path
-        rule = {
-            "pattern": re.escape(norm[:100]),
-            "norm_pattern": norm,
-            "fix_template": fix_strategy[:300],
-            "tool_name": tool_name or "*",
-            "hit_count": 1,
-            "success_rate": 1.0 if success else 0.0,
-            "promoted": False,
-            "last_matched": _now(),
-        }
-        self._data["rules"].append(rule)
+            # New rule — start in Slow Path
+            rule = {
+                "pattern": re.escape(norm[:100]),
+                "norm_pattern": norm,
+                "fix_template": fix_strategy[:300],
+                "tool_name": tool_name or "*",
+                "hit_count": 1,
+                "success_rate": 1.0 if success else 0.0,
+                "promoted": False,
+                "last_matched": _now(),
+            }
+            self._data["rules"].append(rule)
 
-        # Evict oldest unpromoted rules if over limit
-        if len(self._data["rules"]) > _MAX_RULES:
-            unpromoted = [r for r in self._data["rules"] if not r.get("promoted")]
-            unpromoted.sort(key=lambda r: r["last_matched"])
-            to_remove = set(id(r) for r in unpromoted[:len(self._data["rules"]) - _MAX_RULES])
-            self._data["rules"] = [r for r in self._data["rules"] if id(r) not in to_remove]
+            # Evict oldest unpromoted rules if over limit
+            if len(self._data["rules"]) > _MAX_RULES:
+                unpromoted = [r for r in self._data["rules"] if not r.get("promoted")]
+                unpromoted.sort(key=lambda r: r["last_matched"])
+                to_remove = set(id(r) for r in unpromoted[:len(self._data["rules"]) - _MAX_RULES])
+                self._data["rules"] = [r for r in self._data["rules"] if id(r) not in to_remove]
 
-        self._flush()
+            self._flush()
 
     def stats_summary(self) -> str:
         """Short stats string for display."""

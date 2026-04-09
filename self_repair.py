@@ -17,6 +17,7 @@ Safety measures:
 import json
 import os
 import shutil
+import threading
 import time
 
 import anthropic
@@ -63,11 +64,13 @@ class ScriptRepairer:
         self.client = client
         self.model = model or config.MODEL
         self._repair_count: dict[str, int] = {}  # script_path → count
+        self._lock = threading.Lock()
 
     def can_repair(self, script_path: str) -> bool:
         """Check if this script is eligible for self-repair."""
-        key = str(script_path)
-        return self._repair_count.get(key, 0) < MAX_REPAIRS_PER_SCRIPT
+        with self._lock:
+            key = str(script_path)
+            return self._repair_count.get(key, 0) < MAX_REPAIRS_PER_SCRIPT
 
     def repair(
         self,
@@ -79,8 +82,9 @@ class ScriptRepairer:
         """Attempt to repair a script. Returns fixed source code or None."""
         key = str(script_path)
 
-        if not self.can_repair(script_path):
-            return None
+        with self._lock:
+            if self._repair_count.get(key, 0) >= MAX_REPAIRS_PER_SCRIPT:
+                return None
 
         prompt = REPAIR_CODE_PROMPT.format(
             source=source,
@@ -118,16 +122,16 @@ class ScriptRepairer:
                 )
                 return None
 
-            # Backup original
-            backup_path = script_path + ".bak"
-            if not os.path.exists(backup_path):
-                shutil.copy2(script_path, backup_path)
+            # Backup and write (under lock to prevent concurrent file writes)
+            with self._lock:
+                backup_path = script_path + ".bak"
+                if not os.path.exists(backup_path):
+                    shutil.copy2(script_path, backup_path)
 
-            # Write fixed version
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(fixed)
+                with open(script_path, "w", encoding="utf-8") as f:
+                    f.write(fixed)
 
-            self._repair_count[key] = self._repair_count.get(key, 0) + 1
+                self._repair_count[key] = self._repair_count.get(key, 0) + 1
 
             print(
                 f"  {config.COLOR_SYSTEM}[Self-Repair] Fixed {os.path.basename(script_path)} "

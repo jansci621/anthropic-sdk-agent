@@ -14,6 +14,7 @@ Each experience entry captures:
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
 
 import config
@@ -32,6 +33,7 @@ class ExperienceStore:
     def __init__(self, filepath: str = _EXPERIENCE_FILE):
         self.filepath = filepath
         self._data = self._load()
+        self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -43,42 +45,43 @@ class ExperienceStore:
         tool_name: str,
         success: bool,
     ) -> dict:
-        """Add or update an experience entry."""
-        # Normalise the error pattern for deduplication
-        norm_key = _normalise(error_pattern)
+        """Add or update an experience entry (thread-safe)."""
+        with self._lock:
+            # Normalise the error pattern for deduplication
+            norm_key = _normalise(error_pattern)
 
-        # Update existing entry if same pattern + tool
-        for entry in self._data["experiences"]:
-            if entry["norm_key"] == norm_key and entry["tool_name"] == tool_name:
-                n = entry["use_count"]
-                entry["success_rate"] = (entry["success_rate"] * n + int(success)) / (n + 1)
-                entry["use_count"] += 1
-                entry["last_used"] = _now()
-                if success:
-                    entry["fix_strategy"] = fix_strategy  # promote better strategy
-                self._flush()
-                return entry
+            # Update existing entry if same pattern + tool
+            for entry in self._data["experiences"]:
+                if entry["norm_key"] == norm_key and entry["tool_name"] == tool_name:
+                    n = entry["use_count"]
+                    entry["success_rate"] = (entry["success_rate"] * n + int(success)) / (n + 1)
+                    entry["use_count"] += 1
+                    entry["last_used"] = _now()
+                    if success:
+                        entry["fix_strategy"] = fix_strategy  # promote better strategy
+                    self._flush()
+                    return entry
 
-        entry = {
-            "task_summary": task_summary[:200],
-            "error_pattern": error_pattern[:300],
-            "norm_key": norm_key,
-            "fix_strategy": fix_strategy[:400],
-            "tool_name": tool_name,
-            "success": success,
-            "success_rate": 1.0 if success else 0.0,
-            "use_count": 1,
-            "last_used": _now(),
-        }
-        self._data["experiences"].append(entry)
+            entry = {
+                "task_summary": task_summary[:200],
+                "error_pattern": error_pattern[:300],
+                "norm_key": norm_key,
+                "fix_strategy": fix_strategy[:400],
+                "tool_name": tool_name,
+                "success": success,
+                "success_rate": 1.0 if success else 0.0,
+                "use_count": 1,
+                "last_used": _now(),
+            }
+            self._data["experiences"].append(entry)
 
-        # Evict oldest entries if over limit
-        if len(self._data["experiences"]) > _MAX_ENTRIES:
-            self._data["experiences"].sort(key=lambda e: e["last_used"])
-            self._data["experiences"] = self._data["experiences"][-_MAX_ENTRIES:]
+            # Evict oldest entries if over limit
+            if len(self._data["experiences"]) > _MAX_ENTRIES:
+                self._data["experiences"].sort(key=lambda e: e["last_used"])
+                self._data["experiences"] = self._data["experiences"][-_MAX_ENTRIES:]
 
-        self._flush()
-        return entry
+            self._flush()
+            return entry
 
     def retrieve(self, query: str, top_k: int = _TOP_K) -> list[dict]:
         """Return the most relevant experiences for a given query."""

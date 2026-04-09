@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timezone
 
@@ -73,21 +74,23 @@ class MemoryStore:
     def __init__(self, filepath: str = config.MEMORY_FILE):
         self.filepath = filepath
         self._data = self._load()
+        self._lock = threading.Lock()
 
     # ── Public API ───────────────────────────────────────────────────────
 
     def save(self, key: str, value: str, category: str) -> dict:
-        """Save a memory entry and return the stored record."""
-        entry = {
-            "id": uuid.uuid4().hex[:12],
-            "key": key,
-            "value": value,
-            "category": category,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self._data["memories"].append(entry)
-        self._flush()
-        return entry
+        """Save a memory entry and return the stored record (thread-safe)."""
+        with self._lock:
+            entry = {
+                "id": uuid.uuid4().hex[:12],
+                "key": key,
+                "value": value,
+                "category": category,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            self._data["memories"].append(entry)
+            self._flush()
+            return entry
 
     def search(self, query: str = "", category: str = "") -> list[dict]:
         """Search memories by keyword and/or category."""

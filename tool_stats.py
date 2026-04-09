@@ -7,6 +7,7 @@ cautious with unreliable ones.
 
 import json
 import os
+import threading
 from datetime import datetime, timezone
 
 import config
@@ -23,20 +24,25 @@ class ToolStats:
     def __init__(self, filepath: str = _STATS_FILE):
         self.filepath = filepath
         self._data = self._load()
+        self._lock = threading.Lock()
 
     # ── Public API ────────────────────────────────────────────────────────
 
     def record(self, tool_name: str, success: bool):
-        """Record one tool call outcome."""
-        stats = self._data["tools"].setdefault(tool_name, {
-            "success": 0, "failure": 0, "last_used": ""
-        })
-        if success:
-            stats["success"] += 1
-        else:
-            stats["failure"] += 1
-        stats["last_used"] = datetime.now(timezone.utc).isoformat()
-        self._flush()
+        """Record one tool call outcome (thread-safe)."""
+        with self._lock:
+            stats = self._data["tools"].setdefault(tool_name, {
+                "success": 0, "failure": 0, "last_used": ""
+            })
+            if success:
+                stats["success"] += 1
+            else:
+                stats["failure"] += 1
+            stats["last_used"] = datetime.now(timezone.utc).isoformat()
+            try:
+                self._flush()
+            except OSError:
+                pass  # non-critical; will retry on next call
 
     def reliability(self, tool_name: str) -> float | None:
         """Return success rate [0..1] or None if not enough data."""
