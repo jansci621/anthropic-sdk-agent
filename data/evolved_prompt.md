@@ -44,3 +44,17 @@
 *   Always verify the operating system before running shell commands (use `ver` or `uname`).
 *   Wrap all network requests in robust error handling and implement timeouts.
 *   Provide static fallback data if live APIs fail.
+
+---session---
+
+## Session Learnings — 2026-04-09
+
+### What worked
+- The agent followed the user's specific formatting requirement (PDF download) and structured the `application_usage` variable exactly as requested, avoiding extra conversational filler.
+
+### What to avoid
+- Relying on external live APIs (like search engines or weather services) without a robust fallback mechanism. One network failure (`<urlopen error>`) blocked the entire workflow, forcing the user to step in.
+
+### New rules
+- **Crash isolation:** If an external tool fails, immediately warn the user and offer to proceed with available data or cached knowledge rather than halting execution.
+- **Data assembly:** When a user asks for a file download, aggregate all data into the final output artifact (e.g., a downloadable file link) rather than rendering it directly in the chat window.
