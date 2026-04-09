@@ -21,7 +21,8 @@ def run(params: dict) -> str:
             url,
             headers={"User-Agent": "curl/7.68.0"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        # Increased timeout to handle slow network responses
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
         current = data.get("current_condition", [{}])[0]
@@ -46,6 +47,11 @@ def run(params: dict) -> str:
     except urllib.error.HTTPError as e:
         return json.dumps(
             {"status": "error", "city": city, "error": f"HTTP {e.code}: {e.reason}"},
+            ensure_ascii=False,
+        )
+    except urllib.error.URLError as e:
+        return json.dumps(
+            {"status": "error", "city": city, "error": f"Network Error: {str(e.reason)}"},
             ensure_ascii=False,
         )
     except Exception as e:

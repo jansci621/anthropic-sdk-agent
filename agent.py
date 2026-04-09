@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 import anthropic
@@ -576,7 +577,7 @@ class Agent:
 
     _MAX_CONVERSATION_PAIRS = 40  # keep last N user/assistant pairs
 
-    def _stream_response(self, max_retries: int = 10) -> anthropic.Message:
+    def _stream_response(self, max_retries: int = 10) -> anthropic.types.Message:
         """Stream a response with exponential backoff on retryable errors."""
         # Trim old conversation to prevent context overflow
         self._trim_conversation()
@@ -690,18 +691,34 @@ class Agent:
     )
 
     def _execute_tools(self, tool_use_blocks: list) -> list[dict]:
-        """Execute tool calls with error classification and auto-retry for network errors."""
-        results = []
-        for block in tool_use_blocks:
+        """Execute tool calls in parallel when possible, with error classification and auto-retry."""
+        if len(tool_use_blocks) <= 1:
+            block = tool_use_blocks[0]
             print(f"{config.COLOR_SYSTEM}  Executing: {block.name}({block.input}){config.COLOR_RESET}")
-            result_str = self._execute_single_tool(block)
-            results.append({
+            return [{
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": result_str,
-            })
+                "content": self._execute_single_tool(block),
+            }]
 
-        return results
+        # Parallel execution for multiple independent tool calls
+        results: dict[int, dict] = {}
+        with ThreadPoolExecutor(max_workers=min(len(tool_use_blocks), 4)) as pool:
+            futures = {}
+            for idx, block in enumerate(tool_use_blocks):
+                print(f"{config.COLOR_SYSTEM}  Executing: {block.name}({block.input}){config.COLOR_RESET}")
+                futures[pool.submit(self._execute_single_tool, block)] = idx
+
+            for future in as_completed(futures):
+                idx = futures[future]
+                block = tool_use_blocks[idx]
+                results[idx] = {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": future.result(),
+                }
+
+        return [results[i] for i in range(len(tool_use_blocks))]
 
     def _execute_single_tool(self, block) -> str:
         """Execute one tool call with error classification, auto-retry, and RepairAgent diagnosis."""

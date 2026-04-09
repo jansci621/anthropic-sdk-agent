@@ -7,6 +7,10 @@ import numpy as np
 
 import config
 
+# Apply HuggingFace mirror before any HF-related imports
+if config.HF_ENDPOINT:
+    os.environ["HF_ENDPOINT"] = config.HF_ENDPOINT
+
 
 # ── Tool Definition ─────────────────────────────────────────────────────────
 

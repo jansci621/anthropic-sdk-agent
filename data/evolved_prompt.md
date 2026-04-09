@@ -28,3 +28,19 @@
 ## Session Learnings — 2026-04-09
 
 *No tool calls were made during this session, so no operational patterns, failures, or new rules can be derived from agent-tool interaction.*
+
+---session---
+
+## Session Learnings — 2026-04-09
+
+### What worked
+*None identified.*
+
+### What to avoid
+*   **Assuming Linux environments:** Using commands like `lscpu` without checking the OS causes failures on Windows systems ("系统找不到指定的文件").
+*   **External API fragility:** Relying on live web connections (`urlopen`) is unstable; timeouts or network errors occur frequently without fallback logic.
+
+### New rules
+*   Always verify the operating system before running shell commands (use `ver` or `uname`).
+*   Wrap all network requests in robust error handling and implement timeouts.
+*   Provide static fallback data if live APIs fail.

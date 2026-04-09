@@ -114,6 +114,10 @@ CLAUDE_MD_FILE = os.environ.get("AI_CLAUDE_MD", os.path.join(BASE_DIR, "CLAUDE.m
 CWD_CLAUDE_MD = os.path.join(os.getcwd(), "CLAUDE.md")
 
 # ── RAG Settings ────────────────────────────────────────────────────────────
+# HuggingFace mirror for downloading embedding models (useful in China)
+# Set HF_ENDPOINT in .env to override, e.g. HF_ENDPOINT=https://hf-mirror.com
+HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "")
+
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 CHUNK_SIZE = 500       # approximate tokens per chunk
 CHUNK_OVERLAP = 50     # token overlap between chunks

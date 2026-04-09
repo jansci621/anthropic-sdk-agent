@@ -20,6 +20,7 @@ Integration with Agent:
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -169,26 +170,39 @@ class ReActLoop:
             # ── Actions + Observations ────────────────────────────────
             if message.stop_reason == "tool_use":
                 tool_blocks = [b for b in message.content if b.type == "tool_use"]
-                tool_results: list[dict] = []
 
+                # Record metadata first
                 for i, block in enumerate(tool_blocks):
-                    # First action block is the step's primary action for backwards compat
                     if i == 0:
                         step.action = block.name
                         step.action_input = block.input
                     step.actions.append((block.name, block.input))
-
                     self._print_action(step_num, block.name, block.input, i)
 
-                    # Execute → Observation
-                    obs = self._execute_action(block.name, block.input)
-                    step.observations.append(obs)
-                    step.observation = obs  # keep last for simple access
-                    self._print_observation(step_num, obs, i)
+                # Execute tools in parallel
+                obs_map: dict[int, str] = {}
+                if len(tool_blocks) <= 1:
+                    obs = self._execute_action(tool_blocks[0].name, tool_blocks[0].input)
+                    obs_map[0] = obs
+                else:
+                    with ThreadPoolExecutor(max_workers=min(len(tool_blocks), 4)) as pool:
+                        futures = {
+                            pool.submit(self._execute_action, b.name, b.input): i
+                            for i, b in enumerate(tool_blocks)
+                        }
+                        for future in as_completed(futures):
+                            obs_map[futures[future]] = future.result()
 
+                # Collect results in order
+                tool_results: list[dict] = []
+                for i in range(len(tool_blocks)):
+                    obs = obs_map[i]
+                    step.observations.append(obs)
+                    step.observation = obs
+                    self._print_observation(step_num, obs, i)
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "tool_use_id": tool_blocks[i].id,
                         "content": obs,
                     })
 
@@ -218,7 +232,7 @@ class ReActLoop:
         messages: list[dict],
         system: list[dict] | str,
         step: ReActStep,
-    ) -> anthropic.Message:
+    ) -> anthropic.types.Message:
         """Stream one model call, updating *step.thought* in real time."""
         kwargs: dict = {
             "model": self.model,
