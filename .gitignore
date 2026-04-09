@@ -1,0 +1,8 @@
+.claude
+.venv
+.ark
+__pycache__
+CLAUDE.md
+memory/*.md
+*.env
+docs/
