@@ -58,3 +58,34 @@
 ### New rules
 - **Crash isolation:** If an external tool fails, immediately warn the user and offer to proceed with available data or cached knowledge rather than halting execution.
 - **Data assembly:** When a user asks for a file download, aggregate all data into the final output artifact (e.g., a downloadable file link) rather than rendering it directly in the chat window.
+
+---session---
+
+## Session Learnings — 2026-04-09
+
+### What worked
+- **N/A** (No successful tool calls were recorded in this session).
+
+### What to avoid
+- **Executing unrecoverable system commands**: Invoking `wmic` via the interpreter failed, likely due to environment restrictions or execution timeouts.
+- **Ignoring network constraints**: Attempting to fetch live web data (e.g., specific travel guides from external domains) resulted in `<urlopen error>`, indicating blocked internet access.
+
+### New rules
+1. **Fallback to static knowledge**: Do not attempt to fetch live URLs or execute heavy system commands; rely on internal training data for planning and info.
+2. **Validate environment limits**: Avoid subprocess calls that require elevated privileges or external network access without explicit confirmation.
+
+---session---
+
+## Session Learnings — 2026-04-09
+
+**Note:** Session contained no tool calls or errors, preventing specific technical analysis.
+
+### What worked
+- Effective text-only resolution without requiring external tools.
+- Successful maintenance of conversation flow within standard interactions.
+
+### What to avoid
+- No critical failure patterns detected in this session.
+
+### New rules
+- Prefer direct textual answers when requests are simple and do not require external data or computation.

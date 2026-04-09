@@ -71,17 +71,8 @@ _PROVIDER_MODELS = {
 }
 MODEL = os.environ.get("AI_MODEL", _PROVIDER_MODELS.get(PROVIDER, "claude-opus-4-6"))
 
-# Fast/cheap model used by the query router's LLM classifier.
-# Uses each provider's smallest/fastest available model.
-# together/anyscale fall back to the main model — override with AI_ROUTER_MODEL
-# if you have access to a smaller model (e.g. Meta-Llama-3.1-8B-Instruct-Turbo).
-_ROUTER_MODELS = {
-    "anthropic":  "claude-haiku-4-5",
-    "openrouter": "anthropic/claude-haiku-4-5",
-    "together":   "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
-    "anyscale":   "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    "deepseek":   "deepseek-chat",
-}
+# Router uses the same model as the main agent by default.
+# Override with AI_ROUTER_MODEL if you have access to a cheaper model.
 ROUTER_MODEL = os.environ.get("AI_ROUTER_MODEL", MODEL)
 
 # Thinking support — some third-party providers don't support extended thinking
@@ -89,7 +80,7 @@ _THINKING_UNSUPPORTED = {"deepseek", "together", "anyscale"}
 THINKING_ENABLED = PROVIDER not in _THINKING_UNSUPPORTED and os.environ.get("AI_THINKING", "true").lower() != "false"
 THINKING_CONFIG = {"type": "adaptive"} if THINKING_ENABLED else None
 
-MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "16000"))
+MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "128000"))
 
 # Auto-routing: automatically choose between ReAct and general agent mode.
 # Set AI_AUTO_ROUTE=false to disable (always use general agent mode).

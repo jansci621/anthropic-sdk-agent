@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Agent</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; overflow: hidden; }
+
+#app { display: flex; height: 100vh; }
+
+/* Sidebar */
+#sidebar { width: 260px; background: #161b22; border-right: 1px solid #21262d; padding: 20px 16px; display: flex; flex-direction: column; flex-shrink: 0; }
+#sidebar h2 { font-size: 16px; color: #f0f6fc; margin-bottom: 16px; font-weight: 600; }
+.info-item { font-size: 13px; color: #8b949e; margin-bottom: 8px; }
+.info-item span { color: #c9d1d9; }
+#new-chat-btn { margin-top: auto; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+#new-chat-btn:hover { background: #2ea043; }
+
+/* Chat Area */
+#chat-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#messages { flex: 1; overflow-y: auto; padding: 20px; scroll-behavior: smooth; }
+.msg-wrapper { max-width: 800px; margin: 0 auto 16px; }
+.msg-wrapper.user { display: flex; justify-content: flex-end; }
+.msg-bubble { padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; word-break: break-word; white-space: pre-wrap; }
+.msg-bubble.user { background: #1f6feb; color: #fff; max-width: 70%; border-bottom-right-radius: 4px; }
+.msg-bubble.assistant { background: #161b22; border: 1px solid #21262d; max-width: 100%; border-top-left-radius: 4px; }
+
+/* Thinking Block */
+.thinking-block { background: #0d1117; border-left: 3px solid #1f6feb; margin: 10px 0; border-radius: 6px; overflow: hidden; }
+.thinking-block summary { padding: 8px 14px; cursor: pointer; color: #58a6ff; font-size: 13px; font-weight: 500; user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
+.thinking-block summary::before { content: "▸"; transition: transform 0.2s; display: inline-block; }
+.thinking-block[open] summary::before { transform: rotate(90deg); }
+.thinking-block pre { padding: 0 14px 12px; color: #8b949e; font-size: 13px; white-space: pre-wrap; font-family: "Cascadia Code", "Fira Code", monospace; line-height: 1.5; max-height: 400px; overflow-y: auto; }
+
+/* Tool Block */
+.tool-block { background: #1c1206; border-left: 3px solid #d29922; margin: 10px 0; border-radius: 6px; overflow: hidden; }
+.tool-block summary { padding: 8px 14px; cursor: pointer; color: #d29922; font-size: 13px; font-weight: 500; user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
+.tool-block summary::before { content: "▸"; transition: transform 0.2s; display: inline-block; }
+.tool-block[open] summary::before { transform: rotate(90deg); }
+.tool-block .tool-section { padding: 4px 14px; }
+.tool-block .tool-label { font-size: 11px; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
+.tool-block code { color: #e0e0e0; font-size: 13px; font-family: "Cascadia Code", "Fira Code", monospace; white-space: pre-wrap; word-break: break-all; }
+.tool-block .tool-result { border-top: 1px solid #30260a; padding-top: 8px; margin-top: 8px; }
+.tool-status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.tool-status.running { background: #d29922; animation: pulse 1s infinite; }
+.tool-status.done { background: #238636; }
+.tool-status.error { background: #f85149; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+/* Status / System messages */
+.status-msg { color: #6e7681; font-size: 12px; font-style: italic; margin: 4px 0; padding: 2px 8px; max-width: 800px; margin-left: auto; margin-right: auto; }
+.error-msg { color: #f85149; font-size: 13px; margin: 4px 0; padding: 4px 8px; }
+.system-msg { color: #58a6ff; font-size: 12px; margin: 4px 0; padding: 2px 8px; }
+
+/* Typing indicator */
+.typing { display: inline-block; }
+.typing::after { content: "▊"; animation: blink 0.8s infinite; color: #58a6ff; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+/* Input Area */
+#input-area { padding: 16px 20px; background: #161b22; border-top: 1px solid #21262d; }
+#input-form { display: flex; gap: 8px; max-width: 800px; margin: 0 auto; align-items: flex-end; }
+#input-form textarea { flex: 1; background: #0d1117; color: #c9d1d9; border: 1px solid #30363d; border-radius: 8px; padding: 10px 14px; resize: none; font-size: 14px; font-family: inherit; line-height: 1.5; min-height: 44px; max-height: 160px; outline: none; }
+#input-form textarea:focus { border-color: #58a6ff; }
+#input-form textarea::placeholder { color: #484f58; }
+#send-btn { background: #238636; color: #fff; border: none; border-radius: 8px; padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; }
+#send-btn:hover { background: #2ea043; }
+#send-btn:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+#mode-select { background: #0d1117; color: #8b949e; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none; cursor: pointer; }
+
+/* Scrollbar */
+#messages::-webkit-scrollbar { width: 6px; }
+#messages::-webkit-scrollbar-track { background: transparent; }
+#messages::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+/* Connection indicator */
+#conn-status { font-size: 11px; padding: 4px 0; color: #8b949e; text-align: center; }
+#conn-status.connected { color: #238636; }
+#conn-status.disconnected { color: #f85149; }
+
+/* Markdown-lite */
+.msg-bubble.assistant code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-family: "Cascadia Code", "Fira Code", monospace; font-size: 13px; }
+.msg-bubble.assistant pre { background: #161b22; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 8px 0; }
+.msg-bubble.assistant pre code { background: none; padding: 0; }
+.msg-bubble.assistant strong { color: #f0f6fc; }
+.msg-bubble.assistant a { color: #58a6ff; text-decoration: none; }
+.msg-bubble.assistant a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h2>AI Agent</h2>
+    <div id="agent-info"></div>
+    <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+  </aside>
+  <div id="chat-area">
+    <div id="conn-status">Connecting...</div>
+    <div id="messages"></div>
+    <div id="input-area">
+      <form id="input-form" onsubmit="return sendMessage(event)">
+        <select id="mode-select">
+          <option value="auto">Auto</option>
+          <option value="agent">Agent</option>
+          <option value="react">ReAct</option>
+        </select>
+        <textarea id="msg-input" placeholder="Type a message... (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────
+const sessionId = Math.random().toString(36).substring(2, 10);
+let ws = null;
+let currentAssistantEl = null;
+let currentPhase = null;  // "thinking" | "text" | "tool_call" | null
+let thinkingEl = null;
+let textEl = null;
+let toolEl = null;
+let toolPartialJson = "";
+let isProcessing = false;
+
+// ── WebSocket ──────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/${sessionId}`);
+
+  ws.onopen = () => {
+    setConnStatus("connected", "Connected");
+    loadAgentInfo();
+  };
+  ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+  ws.onclose = () => {
+    setConnStatus("disconnected", "Disconnected — reconnecting...");
+    setTimeout(connect, 3000);
+  };
+  ws.onerror = () => {
+    setConnStatus("disconnected", "Connection error");
+  };
+}
+
+function setConnStatus(cls, text) {
+  const el = document.getElementById("conn-status");
+  el.className = cls;
+  el.textContent = text;
+}
+
+async function loadAgentInfo() {
+  try {
+    const resp = await fetch("/api/info");
+    const info = await resp.json();
+    document.getElementById("agent-info").innerHTML =
+      `<div class="info-item">Provider: <span>${info.provider}</span></div>` +
+      `<div class="info-item">Model: <span>${info.model}</span></div>` +
+      `<div class="info-item">Thinking: <span>${info.thinking ? "on" : "off"}</span></div>` +
+      `<div class="info-item">Route: <span>${info.auto_route ? "auto" : "manual"}</span></div>`;
+  } catch {}
+}
+
+// ── Sending ────────────────────────────────────────────────────────────
+function sendMessage(e) {
+  e.preventDefault();
+  const input = document.getElementById("msg-input");
+  const text = input.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return false;
+
+  const mode = document.getElementById("mode-select").value;
+
+  // Render user bubble
+  appendUserBubble(text);
+
+  // Send to server
+  ws.send(JSON.stringify({ message: text, mode: mode }));
+  input.value = "";
+  input.style.height = "auto";
+
+  isProcessing = true;
+  document.getElementById("send-btn").disabled = true;
+
+  // Prepare assistant bubble
+  currentAssistantEl = appendAssistantBubble();
+  currentPhase = null;
+
+  return false;
+}
+
+function newChat() {
+  document.getElementById("messages").innerHTML = "";
+  currentAssistantEl = null;
+  currentPhase = null;
+  isProcessing = false;
+  document.getElementById("send-btn").disabled = false;
+  // Send reset to server via a special message
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "reset" }));
+  }
+}
+
+// ── DOM Helpers ────────────────────────────────────────────────────────
+function appendUserBubble(text) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg-wrapper user";
+  wrapper.innerHTML = `<div class="msg-bubble user">${escapeHtml(text)}</div>`;
+  document.getElementById("messages").appendChild(wrapper);
+  scrollBottom();
+  return wrapper;
+}
+
+function appendAssistantBubble() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "msg-wrapper";
+  const bubble = document.createElement("div");
+  bubble.className = "msg-bubble assistant";
+  wrapper.appendChild(bubble);
+  document.getElementById("messages").appendChild(wrapper);
+  scrollBottom();
+  return bubble;
+}
+
+function appendStatusMsg(text, cls = "status-msg") {
+  const el = document.createElement("div");
+  el.className = cls;
+  el.textContent = text;
+  document.getElementById("messages").appendChild(el);
+  scrollBottom();
+  return el;
+}
+
+function scrollBottom() {
+  const m = document.getElementById("messages");
+  m.scrollTop = m.scrollHeight;
+}
+
+function escapeHtml(text) {
+  const d = document.createElement("div");
+  d.textContent = text;
+  return d.innerHTML;
+}
+
+function finishAssistant() {
+  isProcessing = false;
+  document.getElementById("send-btn").disabled = false;
+  // Remove any trailing typing indicators
+  document.querySelectorAll(".typing").forEach(el => el.remove());
+  currentPhase = null;
+  currentAssistantEl = null;
+}
+
+// ── Event Handling ─────────────────────────────────────────────────────
+function handleEvent(data) {
+  const type = data.type;
+
+  switch (type) {
+    // ── Thinking ──────────────────────────────
+    case "thinking_start":
+      ensureAssistant();
+      thinkingEl = document.createElement("details");
+      thinkingEl.className = "thinking-block";
+      const tSummary = document.createElement("summary");
+      tSummary.textContent = "Thinking...";
+      const tPre = document.createElement("pre");
+      thinkingEl.appendChild(tSummary);
+      thinkingEl.appendChild(tPre);
+      currentAssistantEl.appendChild(thinkingEl);
+      currentPhase = "thinking";
+      scrollBottom();
+      break;
+
+    case "thinking_delta":
+      if (thinkingEl) {
+        thinkingEl.querySelector("pre").textContent += data.text;
+        scrollBottom();
+      }
+      break;
+
+    case "thinking_end":
+      if (thinkingEl) {
+        thinkingEl.open = false;
+      }
+      currentPhase = null;
+      break;
+
+    // ── Text ──────────────────────────────────
+    case "text_start":
+      ensureAssistant();
+      textEl = document.createElement("div");
+      textEl.className = "assistant-text";
+      currentAssistantEl.appendChild(textEl);
+      currentPhase = "text";
+      scrollBottom();
+      break;
+
+    case "text_delta":
+      if (textEl) {
+        textEl.textContent += data.text;
+        scrollBottom();
+      }
+      break;
+
+    case "text_end":
+      currentPhase = null;
+      finishAssistant();
+      break;
+
+    // ── Tool Call ─────────────────────────────
+    case "tool_call_start":
+      ensureAssistant();
+      toolEl = document.createElement("details");
+      toolEl.className = "tool-block";
+      toolEl.open = true;
+      const tName = data.name || "tool";
+      const tSummary2 = document.createElement("summary");
+      tSummary2.innerHTML = `<span class="tool-status running"></span>${escapeHtml(tName)}`;
+      const tInput = document.createElement("div");
+      tInput.className = "tool-section";
+      const tInputLabel = document.createElement("div");
+      tInputLabel.className = "tool-label";
+      tInputLabel.textContent = "Input";
+      const tInputCode = document.createElement("code");
+      tInput.appendChild(tInputLabel);
+      tInput.appendChild(tInputCode);
+      toolEl.appendChild(tSummary2);
+      toolEl.appendChild(tInput);
+      currentAssistantEl.appendChild(toolEl);
+      toolPartialJson = "";
+      currentPhase = "tool_call";
+      scrollBottom();
+      break;
+
+    case "tool_call_delta":
+      if (toolEl) {
+        toolPartialJson += data.partial_json;
+        const code = toolEl.querySelector("code");
+        if (code) code.textContent = toolPartialJson;
+        scrollBottom();
+      }
+      break;
+
+    case "tool_call_end":
+      if (toolEl) {
+        try {
+          const code = toolEl.querySelector("code");
+          if (code) {
+            const parsed = JSON.parse(toolPartialJson);
+            code.textContent = JSON.stringify(parsed, null, 2);
+          }
+        } catch {}
+      }
+      currentPhase = null;
+      break;
+
+    // ── Tool Execute ──────────────────────────
+    case "tool_execute":
+      // Update status indicator if matching tool block
+      if (data.label) {
+        // ReAct mode — status already shown by tool_call
+      }
+      break;
+
+    // ── Tool Result ───────────────────────────
+    case "tool_result":
+      if (toolEl) {
+        const summary = toolEl.querySelector("summary");
+        if (summary) {
+          const statusEl = summary.querySelector(".tool-status");
+          if (statusEl) {
+            statusEl.className = "tool-status done";
+          }
+        }
+        let resultSection = toolEl.querySelector(".tool-result");
+        if (!resultSection) {
+          resultSection = document.createElement("div");
+          resultSection.className = "tool-result tool-section";
+          const rLabel = document.createElement("div");
+          rLabel.className = "tool-label";
+          rLabel.textContent = "Result";
+          resultSection.appendChild(rLabel);
+          toolEl.appendChild(resultSection);
+        }
+        const rCode = document.createElement("code");
+        rCode.textContent = data.result || data.label || "";
+        resultSection.appendChild(rCode);
+        toolEl = null;
+        scrollBottom();
+      }
+      break;
+
+    // ── Meta Events ──────────────────────────
+    case "system":
+      appendStatusMsg(data.message, "system-msg");
+      break;
+
+    case "error":
+      appendStatusMsg(data.message, "error-msg");
+      finishAssistant();
+      break;
+
+    case "status":
+      appendStatusMsg(data.message, "status-msg");
+      break;
+
+    // ── ReAct Events ─────────────────────────
+    case "react_header":
+      appendStatusMsg(data.message || `ReAct: ${data.query || ""}`, "system-msg");
+      break;
+
+    case "react_step_start":
+      // Thinking block will follow
+      break;
+
+    case "react_final":
+      appendStatusMsg("ReAct Final Answer", "system-msg");
+      break;
+
+    default:
+      break;
+  }
+}
+
+function ensureAssistant() {
+  if (!currentAssistantEl) {
+    currentAssistantEl = appendAssistantBubble();
+  }
+}
+
+// ── Textarea auto-resize & Enter handling ──────────────────────────────
+const textarea = document.getElementById("msg-input");
+textarea.addEventListener("input", () => {
+  textarea.style.height = "auto";
+  textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px";
+});
+textarea.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    document.getElementById("input-form").dispatchEvent(new Event("submit"));
+  }
+});
+
+// ── Init ───────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>

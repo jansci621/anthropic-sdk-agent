@@ -27,6 +27,13 @@ from typing import Callable
 import anthropic
 
 import config
+from event_bus import (
+    EVENT_THINKING_START, EVENT_THINKING_DELTA, EVENT_THINKING_END,
+    EVENT_TEXT_START, EVENT_TEXT_DELTA, EVENT_TEXT_END,
+    EVENT_TOOL_CALL_START, EVENT_TOOL_CALL_DELTA, EVENT_TOOL_CALL_END,
+    EVENT_TOOL_EXECUTE, EVENT_TOOL_RESULT,
+    EVENT_REACT_HEADER, EVENT_REACT_STEP_START, EVENT_REACT_FINAL,
+)
 
 
 # ── Data Structures ──────────────────────────────────────────────────────────
@@ -108,6 +115,7 @@ class ReActLoop:
         tool_dispatcher: Callable[[str, dict], str],
         thinking_config: dict | None = None,
         max_tokens: int = 16000,
+        event_bus=None,
     ):
         self.client = client
         self.model = model
@@ -115,6 +123,12 @@ class ReActLoop:
         self.tool_dispatcher = tool_dispatcher
         self.thinking_config = thinking_config
         self.max_tokens = max_tokens
+        self.event_bus = event_bus
+
+    def _emit(self, event_type: str, data: dict | None = None):
+        """Emit an event through the event bus (if configured)."""
+        if self.event_bus:
+            self.event_bus.emit(event_type, data or {})
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -289,42 +303,28 @@ class ReActLoop:
         if event.type == "content_block_start":
             block = event.content_block
             if block.type == "thinking":
-                print(
-                    f"\n{config.COLOR_THINKING}[Thought {step.step_num}]{config.COLOR_RESET} ",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_REACT_STEP_START, {"step_num": step.step_num})
+                self._emit(EVENT_THINKING_START)
             elif block.type == "text":
-                # Text output during tool-use turns is rare but possible
-                print(
-                    f"\n{config.COLOR_TOOL}[Response]{config.COLOR_RESET} ",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_TEXT_START)
             elif block.type == "tool_use":
-                # Action header printed later in _print_action once we have the full name
-                pass
+                self._emit(EVENT_TOOL_CALL_START, {
+                    "name": block.name,
+                    "tool_use_id": block.id,
+                })
 
         elif event.type == "content_block_delta":
             delta = event.delta
             if delta.type == "thinking_delta":
                 thought_parts.append(delta.thinking)
-                print(
-                    f"{config.COLOR_THINKING}{delta.thinking}{config.COLOR_RESET}",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_THINKING_DELTA, {"text": delta.thinking})
             elif delta.type == "text_delta":
-                print(delta.text, end="", flush=True)
+                self._emit(EVENT_TEXT_DELTA, {"text": delta.text})
             elif delta.type == "input_json_delta":
-                print(
-                    f"{config.COLOR_SYSTEM}{delta.partial_json}{config.COLOR_RESET}",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_TOOL_CALL_DELTA, {"partial_json": delta.partial_json})
 
         elif event.type == "content_block_stop":
-            print()
+            pass  # _end events emitted by CLIPrintSink or handled by caller
 
     # ── Tool Execution ────────────────────────────────────────────────────
 
@@ -344,35 +344,32 @@ class ReActLoop:
     _SEPARATOR = "─" * 60
 
     def _print_header(self, query: str):
-        print(
-            f"\n{config.COLOR_SYSTEM}{self._SEPARATOR}\n"
-            f"[ReAct] Query: {query[:120]}\n"
-            f"{self._SEPARATOR}{config.COLOR_RESET}"
-        )
+        self._emit(EVENT_REACT_HEADER, {
+            "query": query[:120],
+            "separator": self._SEPARATOR,
+            "message": f"[ReAct] Query: {query[:120]}",
+        })
 
     def _print_action(self, step_num: int, name: str, tool_input: dict, idx: int):
         label = f"Action {step_num}" if idx == 0 else f"Action {step_num}.{idx + 1}"
         compact = json.dumps(tool_input, ensure_ascii=False)
         if len(compact) > 200:
             compact = compact[:200] + "…"
-        print(
-            f"{config.COLOR_TOOL}[{label}]{config.COLOR_RESET} "
-            f"{name}({compact})",
-            flush=True,
-        )
+        self._emit(EVENT_TOOL_EXECUTE, {
+            "label": label,
+            "name": name,
+            "input": compact,
+        })
 
     def _print_observation(self, step_num: int, obs: str, idx: int):
         label = f"Obs {step_num}" if idx == 0 else f"Obs {step_num}.{idx + 1}"
-        preview = obs if len(obs) <= 300 else obs[:300] + "…"
-        print(
-            f"{config.COLOR_SYSTEM}[{label}]{config.COLOR_RESET} {preview}",
-            flush=True,
-        )
+        self._emit(EVENT_TOOL_RESULT, {
+            "label": label,
+            "result": obs if len(obs) <= 300 else obs[:300] + "…",
+        })
 
     def _print_final_answer(self, answer: str):
-        print(
-            f"\n{config.COLOR_SYSTEM}{self._SEPARATOR}\n"
-            f"[ReAct] Final Answer\n"
-            f"{self._SEPARATOR}{config.COLOR_RESET}"
-        )
+        self._emit(EVENT_REACT_FINAL, {
+            "separator": self._SEPARATOR,
+        })
         # Answer text already streamed above; just close the section

@@ -22,6 +22,13 @@ from evolution import CoEvolutionCoordinator
 from rag import RAGSystem, RAG_TOOL, handle_rag_tool
 from web_tools import WEB_TOOLS, handle_web_tool
 from shell_tools import SHELL_TOOLS, handle_shell_tool
+from event_bus import (
+    EVENT_THINKING_START, EVENT_THINKING_DELTA, EVENT_THINKING_END,
+    EVENT_TEXT_START, EVENT_TEXT_DELTA, EVENT_TEXT_END,
+    EVENT_TOOL_CALL_START, EVENT_TOOL_CALL_DELTA, EVENT_TOOL_CALL_END,
+    EVENT_TOOL_EXECUTE, EVENT_TOOL_RESULT,
+    EVENT_SYSTEM, EVENT_ERROR, EVENT_STATUS,
+)
 from file_tools import FILE_TOOLS, handle_file_tool
 from skills import discover_skills
 from react import ReActLoop
@@ -38,7 +45,16 @@ class Agent:
         api_key: str | None = None,
         base_url: str | None = None,
         system_prompt: str = config.SYSTEM_PROMPT,
+        event_bus: 'EventBus | None' = None,
     ):
+        # Event bus for output abstraction
+        from event_bus import EventBus, CLIPrintSink
+        if event_bus is not None:
+            self.event_bus = event_bus
+        else:
+            self.event_bus = EventBus()
+            self.event_bus.add_sink(CLIPrintSink())
+
         self.model = model or config.MODEL
         self.max_tokens = max_tokens or config.MAX_TOKENS
 
@@ -100,6 +116,15 @@ class Agent:
         self.system = self._build_system_prompt(system_prompt)
         # E1: keep a clean copy for experience injection (never mutate this)
         self._clean_system = self.system
+
+        # Streaming state
+        self._current_block_type: str | None = None
+
+    # ── Event Emission ───────────────────────────────────────────────────
+
+    def _emit(self, event_type: str, data: dict | None = None):
+        """Emit an event through the event bus."""
+        self.event_bus.emit(event_type, data or {})
 
     # ── Main Loop ────────────────────────────────────────────────────────
 
@@ -171,6 +196,13 @@ class Agent:
                 self._cmd_unload_skill(user_input[7:].strip())
                 continue
 
+            # Natural language skill matching (before routing)
+            skill_match = self._match_skill_natural(user_input)
+            if skill_match:
+                skill_name, args = skill_match
+                self._trigger_skill(skill_name, args)
+                continue
+
             if config.AUTO_ROUTE:
                 decision = self.router.route(user_input, len(self.conversation))
                 if decision.mode == "react":
@@ -219,6 +251,33 @@ class Agent:
                 return (skill.name, args)
 
         return None
+
+    def _match_skill_natural(self, user_input: str) -> tuple[str, str] | None:
+        """Match natural language input against skill triggers.
+
+        Scans all skill triggers and returns the first skill whose trigger
+        keyword appears in the user input. Prefers longer (more specific) matches.
+        """
+        input_lower = user_input.lower()
+        candidates: list[tuple[int, str]] = []  # (trigger_len, skill_name)
+
+        for skill in self.skills.values():
+            for trigger in skill.triggers:
+                trigger_lower = trigger.lower().strip()
+                if not trigger_lower:
+                    continue
+                # Skip very short/generic triggers (< 2 chars) to avoid false matches
+                if len(trigger_lower) < 2:
+                    continue
+                if trigger_lower in input_lower:
+                    candidates.append((len(trigger_lower), skill.name))
+
+        if not candidates:
+            return None
+
+        # Prefer the longest matching trigger (most specific skill)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return (candidates[0][1], user_input)
 
     def _trigger_skill(self, skill_name: str, args: str):
         """Directly trigger a skill, inject context into conversation."""
@@ -316,13 +375,10 @@ class Agent:
             return
         snippet = self.experience.format_for_prompt(experiences)
         base = self._clean_system[0]["text"]          # always from the clean copy
-        self.system = [
-            {
-                "type": "text",
-                "text": base + f"\n\n{snippet}",
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        sys_block = {"type": "text", "text": base + f"\n\n{snippet}"}
+        if self.provider == "anthropic":
+            sys_block["cache_control"] = {"type": "ephemeral"}
+        self.system = [sys_block]
 
     def _current_task_summary(self) -> str:
         """Extract a short summary of the current task from conversation."""
@@ -366,25 +422,30 @@ class Agent:
             if cwd_md:
                 full_prompt += f"\n\n## Working Directory Context ({config.CWD_CLAUDE_MD})\n{cwd_md}"
 
-        # Skill prompts + references
-        skill_prompt_parts = []
-        for skill in self.skills.values():
-            if skill.prompt:
-                skill_prompt_parts.append(f"## Skill: {skill.name}\n{skill.prompt}")
-            ref = skill.get_reference()
-            if ref:
-                skill_prompt_parts.append(f"### {skill.name} Reference\n{ref}")
+        # Skill index: only names + descriptions in system prompt (lightweight)
+        # Full skill prompts are injected on-demand when triggered.
+        if self.skills:
+            skill_lines = []
+            for skill in self.skills.values():
+                tools_str = ", ".join(skill.tool_names) if skill.tool_names else ""
+                entry = f"- **{skill.name}**: {skill.description}"
+                if tools_str:
+                    entry += f" (tools: {tools_str})"
+                if skill.triggers:
+                    entry += f" (triggers: {', '.join(skill.triggers[:3])})"
+                skill_lines.append(entry)
+            full_prompt += (
+                "\n\n## Available Skills\n\n"
+                "The following skills are available. When a user request matches a skill, "
+                "use `/skill_name` to activate it, or use its tools directly.\n\n"
+                + "\n".join(skill_lines)
+            )
 
-        if skill_prompt_parts:
-            full_prompt += "\n\n## Active Skills\n\n" + "\n\n".join(skill_prompt_parts)
-
-        return [
-            {
-                "type": "text",
-                "text": full_prompt,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        # cache_control is Anthropic-specific; skip for third-party providers
+        sys_block = {"type": "text", "text": full_prompt}
+        if self.provider == "anthropic":
+            sys_block["cache_control"] = {"type": "ephemeral"}
+        return [sys_block]
 
     # ── ReAct ────────────────────────────────────────────────────────────
 
@@ -398,6 +459,7 @@ class Agent:
                 tool_dispatcher=self._dispatch_tool,
                 thinking_config=self.thinking_config,
                 max_tokens=self.max_tokens,
+                event_bus=self.event_bus,
             )
         return self._react_loop
 
@@ -449,12 +511,21 @@ class Agent:
             try:
                 message = self._stream_response()
             except Exception as e:
-                # Prevent silent failure — feed error back and break gracefully
-                print(f"\n{config.COLOR_SYSTEM}[Error] API call failed: {e}{config.COLOR_RESET}")
+                # Prevent silent failure — detailed diagnostics
+                import traceback
+                self._emit(EVENT_ERROR, {
+                    "message": f"API call failed: {type(e).__name__}: {e}"
+                })
+                self._emit(EVENT_STATUS, {
+                    "message": f"[Error] Model={self.model} | max_tokens={self.max_tokens} | "
+                               f"messages={len(self.conversation)} | "
+                               f"system_prompt_len={len(str(self.system))}"
+                })
                 self.conversation.append({
                     "role": "user",
                     "content": (
-                        f"[SYSTEM ERROR] The last API call failed: {e}\n\n"
+                        f"[SYSTEM ERROR] The last API call failed: "
+                        f"{type(e).__name__}: {e}\n\n"
                         "Please analyze the error and try a different approach."
                     ),
                 })
@@ -491,7 +562,7 @@ class Agent:
                 continue
 
             if message.stop_reason == "max_tokens":
-                print(f"\n{config.COLOR_SYSTEM}[Warning: hit max_tokens limit]{config.COLOR_RESET}")
+                self._emit(EVENT_STATUS, {"message": "[Warning: hit max_tokens limit]"})
                 break
 
             break
@@ -500,7 +571,7 @@ class Agent:
         if not _rolled_back:
             self._maybe_reflect(iteration + 1)
 
-        print()  # blank line after response
+        self._emit(EVENT_TEXT_END)  # signal response complete
 
     def _check_retry_budget(self, tool_use_blocks: list, tool_results: list[dict]) -> list[dict]:
         """L4: Detect when the same tool+input combination fails repeatedly."""
@@ -592,6 +663,15 @@ class Agent:
         if self.thinking_config:
             stream_kwargs["thinking"] = self.thinking_config
 
+        # Diagnostic: show what we're about to send
+        sys_len = sum(len(b.get("text", "")) for b in self.system if isinstance(b, dict))
+        msg_count = len(self.conversation)
+        self._emit(EVENT_STATUS, {
+            "message": f"  [API] Calling {self.model} | system={sys_len} chars | "
+                       f"messages={msg_count} | max_tokens={self.max_tokens} | "
+                       f"thinking={'on' if self.thinking_config else 'off'}"
+        })
+
         for attempt in range(max_retries + 1):
             try:
                 with self.client.messages.stream(**stream_kwargs) as stream:
@@ -608,11 +688,9 @@ class Agent:
                 if not retryable or attempt == max_retries:
                     raise
                 wait = 2 ** attempt * 1.5
-                print(
-                    f"\n{config.COLOR_SYSTEM}[Retry {attempt + 1}/{max_retries}] "
-                    f"API busy, waiting {wait:.0f}s...{config.COLOR_RESET}",
-                    flush=True,
-                )
+                self._emit(EVENT_STATUS, {
+                    "message": f"  [Retry {attempt + 1}/{max_retries}] API busy, waiting {wait:.0f}s..."
+                })
                 time.sleep(wait)
 
     def _trim_conversation(self):
@@ -637,48 +715,44 @@ class Agent:
 
         removed = len(self.conversation) - len(trimmed)
         if removed > 0:
-            print(
-                f"  {config.COLOR_SYSTEM}[Context] Trimmed {removed} old messages "
-                f"to prevent context overflow{config.COLOR_RESET}",
-                flush=True,
-            )
+            self._emit(EVENT_STATUS, {
+                "message": f"  [Context] Trimmed {removed} old messages to prevent context overflow"
+            })
             self.conversation[:] = trimmed
 
     def _handle_event(self, event):
-        """Print streaming events with styled output."""
+        """Route streaming events to the event bus."""
         if event.type == "content_block_start":
             block = event.content_block
+            self._current_block_type = block.type
             if block.type == "thinking":
-                print(f"\n{config.COLOR_THINKING}[Thinking]{config.COLOR_RESET} ", end="", flush=True)
+                self._emit(EVENT_THINKING_START)
             elif block.type == "text":
-                print(f"\n{config.COLOR_TOOL}[Assistant]{config.COLOR_RESET} ", end="", flush=True)
+                self._emit(EVENT_TEXT_START)
             elif block.type == "tool_use":
-                print(
-                    f"\n{config.COLOR_TOOL}[Tool: {block.name}]{config.COLOR_RESET}",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_TOOL_CALL_START, {
+                    "name": block.name,
+                    "tool_use_id": block.id,
+                })
 
         elif event.type == "content_block_delta":
             delta = event.delta
             if delta.type == "thinking_delta":
-                print(
-                    f"{config.COLOR_THINKING}{delta.thinking}{config.COLOR_RESET}",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_THINKING_DELTA, {"text": delta.thinking})
             elif delta.type == "text_delta":
-                print(delta.text, end="", flush=True)
+                self._emit(EVENT_TEXT_DELTA, {"text": delta.text})
             elif delta.type == "input_json_delta":
-                # Tool input streaming — show partial JSON
-                print(
-                    f"{config.COLOR_SYSTEM}{delta.partial_json}{config.COLOR_RESET}",
-                    end="",
-                    flush=True,
-                )
+                self._emit(EVENT_TOOL_CALL_DELTA, {"partial_json": delta.partial_json})
 
         elif event.type == "content_block_stop":
-            print()  # newline after each block
+            block_type = self._current_block_type
+            if block_type == "thinking":
+                self._emit(EVENT_THINKING_END)
+            elif block_type == "text":
+                self._emit(EVENT_TEXT_END)
+            elif block_type == "tool_use":
+                self._emit(EVENT_TOOL_CALL_END)
+            self._current_block_type = None
 
     # ── Tool Execution ───────────────────────────────────────────────────
 
@@ -694,7 +768,7 @@ class Agent:
         """Execute tool calls in parallel when possible, with error classification and auto-retry."""
         if len(tool_use_blocks) <= 1:
             block = tool_use_blocks[0]
-            print(f"{config.COLOR_SYSTEM}  Executing: {block.name}({block.input}){config.COLOR_RESET}")
+            self._emit(EVENT_TOOL_EXECUTE, {"name": block.name, "input": json.dumps(block.input, ensure_ascii=False)})
             return [{
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -706,7 +780,7 @@ class Agent:
         with ThreadPoolExecutor(max_workers=min(len(tool_use_blocks), 4)) as pool:
             futures = {}
             for idx, block in enumerate(tool_use_blocks):
-                print(f"{config.COLOR_SYSTEM}  Executing: {block.name}({block.input}){config.COLOR_RESET}")
+                self._emit(EVENT_TOOL_EXECUTE, {"name": block.name, "input": json.dumps(block.input, ensure_ascii=False)})
                 futures[pool.submit(self._execute_single_tool, block)] = idx
 
             for future in as_completed(futures):
@@ -735,11 +809,9 @@ class Agent:
             # Auto-retry network errors once (no LLM turn consumed)
             if classification.strategy == "auto_retry":
                 wait = 1.5
-                print(
-                    f"  {config.COLOR_SYSTEM}[Auto-retry] {classification.detail}, "
-                    f"waiting {wait}s...{config.COLOR_RESET}",
-                    flush=True,
-                )
+                self._emit(EVENT_STATUS, {
+                    "message": f"  [Auto-retry] {classification.detail}, waiting {wait}s..."
+                })
                 time.sleep(wait)
                 try:
                     result = self._dispatch_tool(block.name, block.input)

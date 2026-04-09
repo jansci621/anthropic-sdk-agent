@@ -186,6 +186,11 @@ class QueryRouter:
                 "agent",
             )
             return "react" if text.startswith("react") else "agent"
-        except Exception:
-            # Never let the classifier block the main flow
+        except Exception as e:
+            # Never let the classifier block the main flow — log and fall back
+            print(
+                f"  {config.COLOR_SYSTEM}[Router] LLM classify failed: "
+                f"{type(e).__name__}: {e}, falling back to agent{config.COLOR_RESET}",
+                flush=True,
+            )
             return "agent"

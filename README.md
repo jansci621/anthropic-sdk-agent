@@ -5,6 +5,7 @@
 ## 特性
 
 - **流式对话** — 实时输出思维过程和回复，支持 adaptive thinking
+- **Web UI** — DeepSeek 风格的 Web 聊天界面，实时展示 Thinking、工具调用和结果（`--web`）
 - **持久化记忆** — 跨会话存储和检索用户偏好、项目信息等
 - **RAG 文档检索** — 本地知识库的语义搜索（基于 FAISS + sentence-transformers）
 - **内置工具** — 文件读写、内容搜索、URL 抓取、Web 搜索、Shell 命令执行
@@ -62,11 +63,29 @@ export ANTHROPIC_API_KEY="sk-ant-xxx"
 
 ### 4. 运行
 
+**CLI 模式：**
+
 ```bash
 python main.py
 ```
 
-启动后会看到如下提示：
+**Web UI 模式：**
+
+```bash
+python main.py --web
+```
+
+启动后打开浏览器访问 `http://localhost:8000`，即可使用 DeepSeek 风格的 Web 聊天界面，支持实时流式输出 Thinking、工具调用和结果。
+
+```bash
+# 指定端口
+python main.py --web --port 8080
+
+# 指定监听地址
+python main.py --web --host 127.0.0.1
+```
+
+CLI 模式启动后会看到如下提示：
 
 ```
 ═══ AI Agent with Memory & RAG ═══
@@ -208,14 +227,17 @@ Agent 在运行过程中持续学习和优化：
 | `AI_SKILLS_DIR` | `./skills` | 技能目录路径 |
 | `AI_AUTO_ROUTE` | `true` | 自动路由（ReAct vs 通用模式） |
 | `AI_ROUTER_MODEL` | 自动 | 路由 LLM 分类器使用的模型（默认为各 provider 最快/最便宜的型号） |
+| `HF_ENDPOINT` | — | HuggingFace 镜像地址（国内可设为 `https://hf-mirror.com`） |
 
 ## 项目结构
 
 ```
 anthropic-sdk-agent/
-├── main.py                 # 入口
+├── main.py                 # 入口（CLI / Web 模式）
 ├── agent.py                # Agent 核心：流式循环 + 工具调度 + 自修复/自进化
 ├── config.py               # 配置管理（多 Provider 支持）
+├── event_bus.py            # 事件总线：输出抽象层（CLI / WebSocket）
+├── web_server.py           # FastAPI Web 服务（WebSocket 实时流式推送）
 ├── react.py                # ReAct 循环：Thought → Action → Observation
 ├── router.py               # 自动路由：快规则 + LLM 分类器
 ├── memory.py               # 持久化记忆系统
@@ -242,6 +264,9 @@ anthropic-sdk-agent/
 │   ├── evolved_prompt.md   # 进化后的提示词
 │   ├── fast_rules.json     # 快规则数据
 │   └── tool_stats.json     # 工具统计
+├── web/
+│   └── static/
+│       └── index.html      # Web UI 前端（DeepSeek 风格）
 ├── .env.example            # 配置模板
 └── requirements.txt        # Python 依赖
 ```
