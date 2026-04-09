@@ -7,20 +7,28 @@ import re
 
 # ── Path Safety ──────────────────────────────────────────────────────────────
 
-# All file operations are jailed to this directory tree.
-_WORKSPACE_ROOT = os.path.realpath(os.getcwd())
+# Default sandbox root (used in CLI mode). Web mode overrides per-session.
+_DEFAULT_WORKSPACE = os.path.realpath(os.getcwd())
 
 
-def _safe_path(path: str) -> str:
+def _safe_path(path: str, workspace_root: str | None = None) -> str:
     """Resolve path and verify it stays within the workspace root.
 
+    Args:
+        path: The path to resolve.
+        workspace_root: Sandbox root. Defaults to CWD if None.
     Raises PermissionError if the resolved path escapes the workspace.
     """
-    resolved = os.path.realpath(os.path.abspath(path))
-    if not resolved.startswith(_WORKSPACE_ROOT + os.sep) and resolved != _WORKSPACE_ROOT:
+    root = os.path.realpath(workspace_root or _DEFAULT_WORKSPACE)
+    # Resolve relative paths against workspace_root (not CWD)
+    if workspace_root and not os.path.isabs(path):
+        resolved = os.path.realpath(os.path.join(root, path))
+    else:
+        resolved = os.path.realpath(os.path.abspath(path))
+    if not resolved.startswith(root + os.sep) and resolved != root:
         raise PermissionError(
             f"Access denied: path '{path}' resolves outside workspace "
-            f"({_WORKSPACE_ROOT})"
+            f"({root})"
         )
     return resolved
 
@@ -134,10 +142,10 @@ FILE_TOOLS = [
 _MAX_READ = 20000
 
 
-def _read_file(path: str, offset: int = 1, limit: int = 200) -> str:
+def _read_file(path: str, offset: int = 1, limit: int = 200, workspace_root: str | None = None) -> str:
     """Read file with line range support."""
     try:
-        abs_path = _safe_path(path)
+        abs_path = _safe_path(path, workspace_root)
     except PermissionError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
     if not os.path.isfile(abs_path):
@@ -163,10 +171,10 @@ def _read_file(path: str, offset: int = 1, limit: int = 200) -> str:
     )
 
 
-def _write_file(path: str, content: str) -> str:
+def _write_file(path: str, content: str, workspace_root: str | None = None) -> str:
     """Write content to file, creating dirs as needed."""
     try:
-        abs_path = _safe_path(path)
+        abs_path = _safe_path(path, workspace_root)
     except PermissionError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
@@ -179,9 +187,14 @@ def _write_file(path: str, content: str) -> str:
     )
 
 
-def _list_files(pattern: str, path: str = ".") -> str:
+def _list_files(pattern: str, path: str = ".", workspace_root: str | None = None) -> str:
     """Glob files and return sorted by mtime."""
-    abs_base = os.path.abspath(path)
+    root = os.path.realpath(workspace_root or _DEFAULT_WORKSPACE)
+    # Resolve relative paths against workspace root
+    if workspace_root and not os.path.isabs(path):
+        abs_base = os.path.join(root, path)
+    else:
+        abs_base = os.path.abspath(path)
     matches = _glob.glob(os.path.join(abs_base, pattern), recursive=True)
     # Sort by modification time
     matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -193,9 +206,14 @@ def _list_files(pattern: str, path: str = ".") -> str:
     )
 
 
-def _search_content(pattern: str, path: str = ".", glob_pattern: str = None, max_results: int = 50) -> str:
+def _search_content(pattern: str, path: str = ".", glob_pattern: str = None, max_results: int = 50, workspace_root: str | None = None) -> str:
     """Grep-like content search."""
-    abs_path = os.path.abspath(path)
+    root = os.path.realpath(workspace_root or _DEFAULT_WORKSPACE)
+    # Resolve relative paths against workspace root
+    if workspace_root and not os.path.isabs(path):
+        abs_path = os.path.join(root, path)
+    else:
+        abs_path = os.path.abspath(path)
     try:
         regex = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
@@ -236,25 +254,28 @@ def _search_content(pattern: str, path: str = ".", glob_pattern: str = None, max
 
 # ── Tool Dispatch ────────────────────────────────────────────────────────────
 
-def handle_file_tool(name: str, tool_input: dict) -> str:
+def handle_file_tool(name: str, tool_input: dict, workspace_root: str | None = None) -> str:
     """Dispatch a file tool call and return the JSON result string."""
     if name == "read_file":
         return _read_file(
             path=tool_input["path"],
             offset=tool_input.get("offset", 1),
             limit=tool_input.get("limit", 200),
+            workspace_root=workspace_root,
         )
 
     if name == "write_file":
         return _write_file(
             path=tool_input["path"],
             content=tool_input["content"],
+            workspace_root=workspace_root,
         )
 
     if name == "list_files":
         return _list_files(
             pattern=tool_input["pattern"],
             path=tool_input.get("path", "."),
+            workspace_root=workspace_root,
         )
 
     if name == "search_content":
@@ -263,6 +284,7 @@ def handle_file_tool(name: str, tool_input: dict) -> str:
             path=tool_input.get("path", "."),
             glob_pattern=tool_input.get("glob"),
             max_results=tool_input.get("max_results", 50),
+            workspace_root=workspace_root,
         )
 
     return json.dumps({"error": f"Unknown file tool: {name}"})

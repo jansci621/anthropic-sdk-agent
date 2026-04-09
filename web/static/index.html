@@ -11,12 +11,26 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 #app { display: flex; height: 100vh; }
 
 /* Sidebar */
-#sidebar { width: 260px; background: #161b22; border-right: 1px solid #21262d; padding: 20px 16px; display: flex; flex-direction: column; flex-shrink: 0; }
-#sidebar h2 { font-size: 16px; color: #f0f6fc; margin-bottom: 16px; font-weight: 600; }
-.info-item { font-size: 13px; color: #8b949e; margin-bottom: 8px; }
-.info-item span { color: #c9d1d9; }
-#new-chat-btn { margin-top: auto; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
+#sidebar { width: 280px; background: #161b22; border-right: 1px solid #21262d; display: flex; flex-direction: column; flex-shrink: 0; }
+#sidebar-header { padding: 16px; border-bottom: 1px solid #21262d; }
+#sidebar-header h2 { font-size: 16px; color: #f0f6fc; font-weight: 600; margin-bottom: 12px; }
+#new-chat-btn { width: 100%; background: #238636; color: #fff; border: none; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; }
 #new-chat-btn:hover { background: #2ea043; }
+.info-item { font-size: 12px; color: #8b949e; margin-top: 6px; }
+.info-item span { color: #c9d1d9; }
+
+/* Session List */
+#session-list { flex: 1; overflow-y: auto; padding: 8px; }
+#session-list::-webkit-scrollbar { width: 4px; }
+#session-list::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
+.session-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; transition: background 0.15s; position: relative; }
+.session-item:hover { background: #1c2128; }
+.session-item.active { background: #1c2128; border: 1px solid #30363d; }
+.session-title { font-size: 13px; color: #c9d1d9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 20px; }
+.session-time { font-size: 11px; color: #6e7681; margin-top: 4px; }
+.session-delete { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #6e7681; cursor: pointer; font-size: 16px; padding: 4px; border-radius: 4px; opacity: 0; transition: opacity 0.15s; }
+.session-item:hover .session-delete { opacity: 1; }
+.session-delete:hover { color: #f85149; background: #21262d; }
 
 /* Chat Area */
 #chat-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
@@ -30,14 +44,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 /* Thinking Block */
 .thinking-block { background: #0d1117; border-left: 3px solid #1f6feb; margin: 10px 0; border-radius: 6px; overflow: hidden; }
 .thinking-block summary { padding: 8px 14px; cursor: pointer; color: #58a6ff; font-size: 13px; font-weight: 500; user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
-.thinking-block summary::before { content: "▸"; transition: transform 0.2s; display: inline-block; }
+.thinking-block summary::before { content: "\25B8"; transition: transform 0.2s; display: inline-block; }
 .thinking-block[open] summary::before { transform: rotate(90deg); }
 .thinking-block pre { padding: 0 14px 12px; color: #8b949e; font-size: 13px; white-space: pre-wrap; font-family: "Cascadia Code", "Fira Code", monospace; line-height: 1.5; max-height: 400px; overflow-y: auto; }
 
 /* Tool Block */
 .tool-block { background: #1c1206; border-left: 3px solid #d29922; margin: 10px 0; border-radius: 6px; overflow: hidden; }
 .tool-block summary { padding: 8px 14px; cursor: pointer; color: #d29922; font-size: 13px; font-weight: 500; user-select: none; list-style: none; display: flex; align-items: center; gap: 6px; }
-.tool-block summary::before { content: "▸"; transition: transform 0.2s; display: inline-block; }
+.tool-block summary::before { content: "\25B8"; transition: transform 0.2s; display: inline-block; }
 .tool-block[open] summary::before { transform: rotate(90deg); }
 .tool-block .tool-section { padding: 4px 14px; }
 .tool-block .tool-label { font-size: 11px; color: #8b949e; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 0.5px; }
@@ -53,11 +67,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .status-msg { color: #6e7681; font-size: 12px; font-style: italic; margin: 4px 0; padding: 2px 8px; max-width: 800px; margin-left: auto; margin-right: auto; }
 .error-msg { color: #f85149; font-size: 13px; margin: 4px 0; padding: 4px 8px; }
 .system-msg { color: #58a6ff; font-size: 12px; margin: 4px 0; padding: 2px 8px; }
-
-/* Typing indicator */
-.typing { display: inline-block; }
-.typing::after { content: "▊"; animation: blink 0.8s infinite; color: #58a6ff; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
 /* Input Area */
 #input-area { padding: 16px 20px; background: #161b22; border-top: 1px solid #21262d; }
@@ -87,14 +96,48 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .msg-bubble.assistant strong { color: #f0f6fc; }
 .msg-bubble.assistant a { color: #58a6ff; text-decoration: none; }
 .msg-bubble.assistant a:hover { text-decoration: underline; }
+
+/* File Browser Modal */
+#file-modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1000; align-items: center; justify-content: center; }
+#file-modal.open { display: flex; }
+#file-panel { width: 700px; max-width: 90vw; max-height: 80vh; background: #161b22; border: 1px solid #30363d; border-radius: 12px; display: flex; flex-direction: column; overflow: hidden; }
+#file-header { padding: 16px 20px; border-bottom: 1px solid #21262d; display: flex; align-items: center; justify-content: space-between; }
+#file-header h3 { color: #f0f6fc; font-size: 15px; }
+#file-close { background: none; border: none; color: #8b949e; font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 4px; }
+#file-close:hover { color: #f0f6fc; background: #21262d; }
+#file-breadcrumb { padding: 10px 20px; background: #0d1117; font-size: 13px; color: #8b949e; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+#file-breadcrumb span { cursor: pointer; color: #58a6ff; }
+#file-breadcrumb span:hover { text-decoration: underline; }
+#file-breadcrumb .sep { color: #6e7681; }
+#file-content { flex: 1; overflow-y: auto; }
+.file-list { padding: 8px; }
+.file-entry { display: flex; align-items: center; padding: 8px 12px; border-radius: 6px; cursor: pointer; gap: 10px; }
+.file-entry:hover { background: #1c2128; }
+.file-icon { font-size: 16px; width: 20px; text-align: center; flex-shrink: 0; }
+.file-name { flex: 1; font-size: 13px; color: #c9d1d9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-size { font-size: 12px; color: #6e7681; flex-shrink: 0; }
+.file-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.file-actions a { font-size: 12px; color: #58a6ff; text-decoration: none; padding: 2px 8px; border-radius: 4px; }
+.file-actions a:hover { background: #1c2128; }
+#file-viewer { display: none; flex: 1; flex-direction: column; }
+#file-viewer.active { display: flex; }
+#file-viewer-toolbar { padding: 8px 20px; border-bottom: 1px solid #21262d; display: flex; gap: 8px; align-items: center; }
+#file-viewer-toolbar button { background: #21262d; color: #c9d1d9; border: none; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+#file-viewer-toolbar button:hover { background: #30363d; }
+#file-viewer-toolbar .fname { color: #8b949e; font-size: 12px; margin-left: auto; }
+#file-viewer pre { flex: 1; margin: 0; padding: 16px 20px; background: transparent; color: #c9d1d9; font-family: "Cascadia Code", "Fira Code", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; overflow-y: auto; }
 </style>
 </head>
 <body>
 <div id="app">
   <aside id="sidebar">
-    <h2>AI Agent</h2>
-    <div id="agent-info"></div>
-    <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+    <div id="sidebar-header">
+      <h2>AI Agent</h2>
+      <button id="new-chat-btn" onclick="newChat()">+ New Chat</button>
+      <button id="files-btn" onclick="openFileBrowser()" style="width:100%;margin-top:8px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px 16px;cursor:pointer;font-size:14px;">Files</button>
+      <div id="agent-info"></div>
+    </div>
+    <div id="session-list"></div>
   </aside>
   <div id="chat-area">
     <div id="conn-status">Connecting...</div>
@@ -111,33 +154,187 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
       </form>
     </div>
   </div>
+
+  <!-- File Browser Modal -->
+  <div id="file-modal">
+    <div id="file-panel">
+      <div id="file-header">
+        <h3>Files</h3>
+        <button id="file-close" onclick="closeFileBrowser()">&times;</button>
+      </div>
+      <div id="file-breadcrumb"></div>
+      <div id="file-content">
+        <div class="file-list" id="file-list"></div>
+        <div id="file-viewer">
+          <div id="file-viewer-toolbar">
+            <button onclick="fileBrowserBack()">&larr; Back</button>
+            <button onclick="downloadCurrentFile()">Download</button>
+            <span class="fname" id="file-viewer-name"></span>
+          </div>
+          <pre id="file-viewer-code"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
 // ── State ──────────────────────────────────────────────────────────────
-const sessionId = Math.random().toString(36).substring(2, 10);
+let currentSessionId = null;
 let ws = null;
 let currentAssistantEl = null;
-let currentPhase = null;  // "thinking" | "text" | "tool_call" | null
+let currentPhase = null;
 let thinkingEl = null;
 let textEl = null;
 let toolEl = null;
 let toolPartialJson = "";
 let isProcessing = false;
 
+// ── Session Management ─────────────────────────────────────────────────
+function genId() { return Math.random().toString(36).substring(2, 10); }
+
+async function loadSessions() {
+  try {
+    const resp = await fetch("/api/sessions");
+    const sessions = await resp.json();
+    const list = document.getElementById("session-list");
+    list.innerHTML = "";
+    sessions.forEach(s => {
+      const item = document.createElement("div");
+      item.className = "session-item" + (s.id === currentSessionId ? " active" : "");
+      item.dataset.id = s.id;
+      item.innerHTML =
+        `<div class="session-title">${escapeHtml(s.title)}</div>` +
+        `<div class="session-time">${formatTime(s.updated || s.created)}</div>` +
+        `<button class="session-delete" title="Delete" onclick="event.stopPropagation(); deleteSession('${s.id}')">&times;</button>`;
+      item.onclick = () => switchSession(s.id);
+      list.appendChild(item);
+    });
+  } catch {}
+}
+
+async function deleteSession(id) {
+  await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+  if (id === currentSessionId) newChat();
+  else loadSessions();
+}
+
+async function switchSession(id) {
+  if (id === currentSessionId) return;
+  currentSessionId = id;
+  localStorage.setItem("sessionId", currentSessionId);
+  document.getElementById("messages").innerHTML = "";
+  currentAssistantEl = null;
+  currentPhase = null;
+  isProcessing = false;
+  document.getElementById("send-btn").disabled = false;
+
+  // Load history
+  try {
+    const resp = await fetch(`/api/sessions/${id}`);
+    const data = await resp.json();
+    if (data.messages) renderHistory(data.messages);
+  } catch {}
+
+  // Reconnect WebSocket to new session
+  connectWS(() => { loadSessions(); });
+}
+
+function renderHistory(messages) {
+  for (const msg of messages) {
+    if (msg.role === "user") {
+      const text = typeof msg.content === "string" ? msg.content : "";
+      if (text) appendUserBubble(text);
+    } else if (msg.role === "assistant") {
+      const bubble = appendAssistantBubble();
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "thinking" && block.thinking) {
+            const details = document.createElement("details");
+            details.className = "thinking-block";
+            const sum = document.createElement("summary");
+            sum.textContent = "Thinking...";
+            const pre = document.createElement("pre");
+            pre.textContent = block.thinking;
+            details.appendChild(sum);
+            details.appendChild(pre);
+            bubble.appendChild(details);
+          } else if (block.type === "text" && block.text) {
+            const div = document.createElement("div");
+            div.className = "assistant-text";
+            div.textContent = block.text;
+            bubble.appendChild(div);
+          } else if (block.type === "tool_use") {
+            const details = document.createElement("details");
+            details.className = "tool-block";
+            const sum = document.createElement("summary");
+            sum.innerHTML = `<span class="tool-status done"></span>${escapeHtml(block.name || "tool")}`;
+            const inputDiv = document.createElement("div");
+            inputDiv.className = "tool-section";
+            const lbl = document.createElement("div");
+            lbl.className = "tool-label";
+            lbl.textContent = "Input";
+            const code = document.createElement("code");
+            try { code.textContent = JSON.stringify(block.input, null, 2); } catch { code.textContent = ""; }
+            inputDiv.appendChild(lbl);
+            inputDiv.appendChild(code);
+            details.appendChild(sum);
+            details.appendChild(inputDiv);
+            bubble.appendChild(details);
+          }
+        }
+      } else if (typeof msg.content === "string" && msg.content) {
+        const div = document.createElement("div");
+        div.className = "assistant-text";
+        div.textContent = msg.content;
+        bubble.appendChild(div);
+      }
+    }
+  }
+  scrollBottom();
+}
+
+function formatTime(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now - d;
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return "just now";
+    if (diffMin < 60) return `${diffMin}m ago`;
+    const diffHr = Math.floor(diffMin / 60);
+    if (diffHr < 24) return `${diffHr}h ago`;
+    return d.toLocaleDateString();
+  } catch { return ""; }
+}
+
+function newChat() {
+  currentSessionId = genId();
+  localStorage.setItem("sessionId", currentSessionId);
+  document.getElementById("messages").innerHTML = "";
+  currentAssistantEl = null;
+  currentPhase = null;
+  isProcessing = false;
+  document.getElementById("send-btn").disabled = false;
+  // Connect WS first — backend saves old session on switch, then load list
+  connectWS(() => { loadSessions(); });
+}
+
 // ── WebSocket ──────────────────────────────────────────────────────────
-function connect() {
+function connectWS(onReady) {
+  if (ws) { ws.onclose = null; ws.close(); }
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  ws = new WebSocket(`${proto}//${location.host}/ws/${sessionId}`);
+  ws = new WebSocket(`${proto}//${location.host}/ws/${currentSessionId}`);
 
   ws.onopen = () => {
     setConnStatus("connected", "Connected");
-    loadAgentInfo();
+    if (onReady) onReady();
   };
   ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
   ws.onclose = () => {
     setConnStatus("disconnected", "Disconnected — reconnecting...");
-    setTimeout(connect, 3000);
+    setTimeout(() => { if (currentSessionId) connectWS(); }, 3000);
   };
   ws.onerror = () => {
     setConnStatus("disconnected", "Connection error");
@@ -150,18 +347,6 @@ function setConnStatus(cls, text) {
   el.textContent = text;
 }
 
-async function loadAgentInfo() {
-  try {
-    const resp = await fetch("/api/info");
-    const info = await resp.json();
-    document.getElementById("agent-info").innerHTML =
-      `<div class="info-item">Provider: <span>${info.provider}</span></div>` +
-      `<div class="info-item">Model: <span>${info.model}</span></div>` +
-      `<div class="info-item">Thinking: <span>${info.thinking ? "on" : "off"}</span></div>` +
-      `<div class="info-item">Route: <span>${info.auto_route ? "auto" : "manual"}</span></div>`;
-  } catch {}
-}
-
 // ── Sending ────────────────────────────────────────────────────────────
 function sendMessage(e) {
   e.preventDefault();
@@ -170,35 +355,17 @@ function sendMessage(e) {
   if (!text || !ws || ws.readyState !== WebSocket.OPEN) return false;
 
   const mode = document.getElementById("mode-select").value;
-
-  // Render user bubble
   appendUserBubble(text);
-
-  // Send to server
   ws.send(JSON.stringify({ message: text, mode: mode }));
   input.value = "";
   input.style.height = "auto";
 
   isProcessing = true;
   document.getElementById("send-btn").disabled = true;
-
-  // Prepare assistant bubble
   currentAssistantEl = appendAssistantBubble();
   currentPhase = null;
 
   return false;
-}
-
-function newChat() {
-  document.getElementById("messages").innerHTML = "";
-  currentAssistantEl = null;
-  currentPhase = null;
-  isProcessing = false;
-  document.getElementById("send-btn").disabled = false;
-  // Send reset to server via a special message
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "reset" }));
-  }
 }
 
 // ── DOM Helpers ────────────────────────────────────────────────────────
@@ -245,10 +412,10 @@ function escapeHtml(text) {
 function finishAssistant() {
   isProcessing = false;
   document.getElementById("send-btn").disabled = false;
-  // Remove any trailing typing indicators
-  document.querySelectorAll(".typing").forEach(el => el.remove());
   currentPhase = null;
   currentAssistantEl = null;
+  // Refresh session list to update title/time
+  loadSessions();
 }
 
 // ── Event Handling ─────────────────────────────────────────────────────
@@ -256,7 +423,6 @@ function handleEvent(data) {
   const type = data.type;
 
   switch (type) {
-    // ── Thinking ──────────────────────────────
     case "thinking_start":
       ensureAssistant();
       thinkingEl = document.createElement("details");
@@ -279,13 +445,10 @@ function handleEvent(data) {
       break;
 
     case "thinking_end":
-      if (thinkingEl) {
-        thinkingEl.open = false;
-      }
+      if (thinkingEl) { thinkingEl.open = false; }
       currentPhase = null;
       break;
 
-    // ── Text ──────────────────────────────────
     case "text_start":
       ensureAssistant();
       textEl = document.createElement("div");
@@ -296,10 +459,7 @@ function handleEvent(data) {
       break;
 
     case "text_delta":
-      if (textEl) {
-        textEl.textContent += data.text;
-        scrollBottom();
-      }
+      if (textEl) { textEl.textContent += data.text; scrollBottom(); }
       break;
 
     case "text_end":
@@ -307,7 +467,6 @@ function handleEvent(data) {
       finishAssistant();
       break;
 
-    // ── Tool Call ─────────────────────────────
     case "tool_call_start":
       ensureAssistant();
       toolEl = document.createElement("details");
@@ -345,32 +504,21 @@ function handleEvent(data) {
       if (toolEl) {
         try {
           const code = toolEl.querySelector("code");
-          if (code) {
-            const parsed = JSON.parse(toolPartialJson);
-            code.textContent = JSON.stringify(parsed, null, 2);
-          }
+          if (code) { const p = JSON.parse(toolPartialJson); code.textContent = JSON.stringify(p, null, 2); }
         } catch {}
       }
       currentPhase = null;
       break;
 
-    // ── Tool Execute ──────────────────────────
     case "tool_execute":
-      // Update status indicator if matching tool block
-      if (data.label) {
-        // ReAct mode — status already shown by tool_call
-      }
       break;
 
-    // ── Tool Result ───────────────────────────
     case "tool_result":
       if (toolEl) {
         const summary = toolEl.querySelector("summary");
         if (summary) {
           const statusEl = summary.querySelector(".tool-status");
-          if (statusEl) {
-            statusEl.className = "tool-status done";
-          }
+          if (statusEl) statusEl.className = "tool-status done";
         }
         let resultSection = toolEl.querySelector(".tool-result");
         if (!resultSection) {
@@ -390,7 +538,6 @@ function handleEvent(data) {
       }
       break;
 
-    // ── Meta Events ──────────────────────────
     case "system":
       appendStatusMsg(data.message, "system-msg");
       break;
@@ -404,13 +551,11 @@ function handleEvent(data) {
       appendStatusMsg(data.message, "status-msg");
       break;
 
-    // ── ReAct Events ─────────────────────────
     case "react_header":
       appendStatusMsg(data.message || `ReAct: ${data.query || ""}`, "system-msg");
       break;
 
     case "react_step_start":
-      // Thinking block will follow
       break;
 
     case "react_final":
@@ -423,9 +568,7 @@ function handleEvent(data) {
 }
 
 function ensureAssistant() {
-  if (!currentAssistantEl) {
-    currentAssistantEl = appendAssistantBubble();
-  }
+  if (!currentAssistantEl) currentAssistantEl = appendAssistantBubble();
 }
 
 // ── Textarea auto-resize & Enter handling ──────────────────────────────
@@ -442,7 +585,171 @@ textarea.addEventListener("keydown", (e) => {
 });
 
 // ── Init ───────────────────────────────────────────────────────────────
-connect();
+async function init() {
+  // Load agent info
+  try {
+    const resp = await fetch("/api/info");
+    const info = await resp.json();
+    document.getElementById("agent-info").innerHTML =
+      `<div class="info-item">Provider: <span>${info.provider}</span></div>` +
+      `<div class="info-item">Model: <span>${info.model}</span></div>`;
+  } catch {}
+
+  // Load sessions and restore or create new
+  try {
+    const resp = await fetch("/api/sessions");
+    const sessions = await resp.json();
+    // Always prefer localStorage session ID — even if not yet saved to disk
+    // (agent may still be processing the first message)
+    const savedId = localStorage.getItem("sessionId");
+    if (savedId) {
+      currentSessionId = savedId;
+    } else if (sessions.length > 0) {
+      currentSessionId = sessions[0].id;
+    } else {
+      currentSessionId = genId();
+    }
+    localStorage.setItem("sessionId", currentSessionId);
+  } catch {
+    const savedId = localStorage.getItem("sessionId");
+    currentSessionId = savedId || genId();
+    localStorage.setItem("sessionId", currentSessionId);
+  }
+
+  loadSessions();
+  connectWS(() => { loadSessions(); });
+}
+
+init();
+
+// ── File Browser ────────────────────────────────────────────────────────
+let fileCurrentPath = "";
+let fileViewingPath = "";
+
+function openFileBrowser() {
+  document.getElementById("file-modal").classList.add("open");
+  fileCurrentPath = "";
+  fileViewingPath = "";
+  showFileList();
+}
+
+function closeFileBrowser() {
+  document.getElementById("file-modal").classList.remove("open");
+}
+
+// Close modal on backdrop click
+document.getElementById("file-modal").addEventListener("click", (e) => {
+  if (e.target === document.getElementById("file-modal")) closeFileBrowser();
+});
+
+async function showFileList() {
+  const listEl = document.getElementById("file-list");
+  const viewerEl = document.getElementById("file-viewer");
+  listEl.style.display = "block";
+  viewerEl.classList.remove("active");
+
+  // Breadcrumb
+  const bc = document.getElementById("file-breadcrumb");
+  const parts = fileCurrentPath ? fileCurrentPath.split("/") : [];
+  let bcHtml = `<span onclick="fileCurrentPath='';showFileList()">root</span>`;
+  let accumulated = "";
+  for (const p of parts) {
+    accumulated += (accumulated ? "/" : "") + p;
+    const ap = accumulated;
+    bcHtml += `<span class="sep">/</span><span onclick="fileCurrentPath='${ap}';showFileList()">${escapeHtml(p)}</span>`;
+  }
+  bc.innerHTML = bcHtml;
+
+  try {
+    const resp = await fetch(`/api/files/list?session_id=${encodeURIComponent(currentSessionId)}&path=${encodeURIComponent(fileCurrentPath)}`);
+    if (!resp.ok) {
+      let errMsg = `HTTP ${resp.status}`;
+      try { const errData = await resp.json(); errMsg = errData.error || errMsg; } catch {}
+      listEl.innerHTML = `<div style="padding:20px;color:#f85149">${escapeHtml(errMsg)}</div>`;
+      return;
+    }
+    const data = await resp.json();
+    if (data.error) { listEl.innerHTML = `<div style="padding:20px;color:#f85149">${escapeHtml(data.error)}</div>`; return; }
+    if (!Array.isArray(data.entries)) { listEl.innerHTML = `<div style="padding:20px;color:#f85149">Unexpected response format</div>`; return; }
+    listEl.innerHTML = "";
+    // Parent dir link
+    if (fileCurrentPath) {
+      const parent = fileCurrentPath.includes("/") ? fileCurrentPath.substring(0, fileCurrentPath.lastIndexOf("/")) : "";
+      const parentEntry = document.createElement("div");
+      parentEntry.className = "file-entry";
+      parentEntry.onclick = () => { fileCurrentPath = parent; showFileList(); };
+      parentEntry.innerHTML = `<span class="file-icon">📁</span><span class="file-name" style="color:#8b949e">..</span><span class="file-size"></span>`;
+      listEl.appendChild(parentEntry);
+    }
+    for (const e of data.entries) {
+      const icon = e.is_dir ? "📁" : _fileIcon(e.name);
+      const size = e.is_dir ? "" : _formatSize(e.size);
+      const entry = document.createElement("div");
+      entry.className = "file-entry";
+      if (e.is_dir) {
+        entry.onclick = () => { fileCurrentPath = e.path; showFileList(); };
+        entry.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name">${escapeHtml(e.name)}</span><span class="file-size">${size}</span>`;
+      } else {
+        entry.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name" style="cursor:pointer">${escapeHtml(e.name)}</span><span class="file-size">${size}</span><div class="file-actions"><a href="/api/files/download?session_id=${encodeURIComponent(currentSessionId)}&path=${encodeURIComponent(e.path)}" download>Download</a></div>`;
+        entry.querySelector(".file-name").onclick = () => viewFile(e.path);
+      }
+      listEl.appendChild(entry);
+    }
+    if (!data.entries.length && !fileCurrentPath) {
+      listEl.innerHTML = `<div style="padding:20px;color:#6e7681">No files found</div>`;
+    }
+  } catch (ex) {
+    listEl.innerHTML = `<div style="padding:20px;color:#f85149">Error: ${ex}</div>`;
+  }
+}
+
+async function viewFile(path) {
+  fileViewingPath = path;
+  const listEl = document.getElementById("file-list");
+  const viewerEl = document.getElementById("file-viewer");
+  listEl.style.display = "none";
+  viewerEl.classList.add("active");
+  document.getElementById("file-viewer-name").textContent = path;
+
+  try {
+    const resp = await fetch(`/api/files/view?session_id=${encodeURIComponent(currentSessionId)}&path=${encodeURIComponent(path)}`);
+    const text = await resp.text();
+    if (!resp.ok) {
+      document.getElementById("file-viewer-code").textContent = `Error: ${text}`;
+      return;
+    }
+    document.getElementById("file-viewer-code").textContent = text;
+  } catch (ex) {
+    document.getElementById("file-viewer-code").textContent = `Error: ${ex}`;
+  }
+}
+
+function fileBrowserBack() {
+  if (fileViewingPath) {
+    fileViewingPath = "";
+    showFileList();
+  }
+}
+
+function downloadCurrentFile() {
+  if (!fileViewingPath) return;
+  const a = document.createElement("a");
+  a.href = `/api/files/download?session_id=${encodeURIComponent(currentSessionId)}&path=${encodeURIComponent(fileViewingPath)}`;
+  a.download = "";
+  a.click();
+}
+
+function _fileIcon(name) {
+  const ext = name.split(".").pop().toLowerCase();
+  const map = { py: "🐍", js: "📜", ts: "📜", json: "📋", md: "📝", txt: "📄", html: "🌐", css: "🎨", yml: "⚙️", yaml: "⚙️", sh: "⚡", env: "🔒" };
+  return map[ext] || "📄";
+}
+
+function _formatSize(bytes) {
+  if (bytes < 1024) return bytes + "B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + "K";
+  return (bytes / (1024 * 1024)).toFixed(1) + "M";
+}
 </script>
 </body>
 </html>

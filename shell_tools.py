@@ -32,7 +32,7 @@ SHELL_TOOLS = [
 
 # ── Tool Dispatch ────────────────────────────────────────────────────────────
 
-def handle_shell_tool(name: str, tool_input: dict) -> str:
+def handle_shell_tool(name: str, tool_input: dict, workspace_dir: str | None = None) -> str:
     """Dispatch a shell tool call and return the JSON result string."""
     command = tool_input["command"]
     try:
@@ -45,6 +45,7 @@ def handle_shell_tool(name: str, tool_input: dict) -> str:
             capture_output=True,
             text=True,
             timeout=30,
+            cwd=workspace_dir,
         )
         output = (result.stdout or "") + (result.stderr or "")
         if result.returncode != 0 and result.stderr:

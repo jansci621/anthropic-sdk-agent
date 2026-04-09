@@ -108,6 +108,9 @@ class Agent:
         self._turn_checkpoint: int = 0  # conversation length at user turn start
         self._error_log: list[dict] = []
 
+        # Per-session workspace (set by web server, None = use CWD for CLI)
+        self._workspace_dir: str | None = None
+
         # Tools: base tools + skill scripts
         skill_tools = [t for s in self.skills.values() for t in s.tools]
         self.tools = [*MEMORY_TOOLS, RAG_TOOL, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
@@ -680,16 +683,48 @@ class Agent:
 
                     return stream.get_final_message()
             except anthropic.APIStatusError as e:
-                retryable = e.status_code in (429, 503, 529) or (
-                    isinstance(e.body, dict)
-                    and isinstance(e.body.get("error"), dict)
-                    and e.body["error"].get("code") in ("1302", "1305", "overloaded")
+                error_code = (
+                    e.body.get("error", {}).get("code", "")
+                    if isinstance(e.body, dict) and isinstance(e.body.get("error"), dict)
+                    else ""
                 )
+
+                # ── Self-heal: fix conversation/params and retry (once) ──
+                # 1210: API parameter error, 1213: missing field,
+                # 1214: invalid field, 1215: conflicting fields,
+                # 1261: prompt too long, 1230: API call flow error
+                _HEAL_CODES = frozenset(("1210", "1213", "1214", "1215", "1230", "1261"))
+                if error_code in _HEAL_CODES and attempt == 0:
+                    healed = self._heal_conversation(error_code)
+                    # For 1261 (prompt too long), also do aggressive trimming
+                    if error_code == "1261":
+                        self._trim_conversation_aggressive()
+                        stream_kwargs["messages"] = self.conversation
+                        healed = True
+                    # Some proxies don't support thinking — try disabling it
+                    if "thinking" in stream_kwargs and error_code in ("1210", "1214", "1215"):
+                        stream_kwargs.pop("thinking")
+                        self._emit(EVENT_STATUS, {
+                            "message": "  [Self-heal] Disabled thinking (proxy may not support it)"
+                        })
+                        healed = True
+                    if healed:
+                        stream_kwargs["messages"] = self.conversation
+                        self._emit(EVENT_STATUS, {
+                            "message": f"  [Self-heal] Fixed messages (code {error_code}), retrying..."
+                        })
+                        continue
+
+                # ── Retryable: backoff and retry ──
+                # 429/503/529 (HTTP), 1302 (rate limit), 1305/1312 (overloaded),
+                # 1234 (network error), 500 (server error)
+                _RETRY_CODES = frozenset(("1302", "1305", "1312", "1234"))
+                retryable = e.status_code in (429, 500, 503, 529) or error_code in _RETRY_CODES
                 if not retryable or attempt == max_retries:
                     raise
                 wait = 2 ** attempt * 1.5
                 self._emit(EVENT_STATUS, {
-                    "message": f"  [Retry {attempt + 1}/{max_retries}] API busy, waiting {wait:.0f}s..."
+                    "message": f"  [Retry {attempt + 1}/{max_retries}] code={error_code or e.status_code}, waiting {wait:.0f}s..."
                 })
                 time.sleep(wait)
 
@@ -719,6 +754,148 @@ class Agent:
                 "message": f"  [Context] Trimmed {removed} old messages to prevent context overflow"
             })
             self.conversation[:] = trimmed
+
+    def _trim_conversation_aggressive(self):
+        """Aggressively trim conversation for prompt-too-long errors (code 1261).
+
+        Keeps only the system prompt + last 6 messages (3 pairs).
+        """
+        keep = 6
+        if len(self.conversation) <= keep:
+            return
+        first_user = None
+        if self.conversation and self.conversation[0].get("role") == "user":
+            first_user = self.conversation[0]
+        trimmed = self.conversation[-keep:]
+        if first_user:
+            trimmed = [first_user] + trimmed
+        removed = len(self.conversation) - len(trimmed)
+        if removed > 0:
+            self._emit(EVENT_STATUS, {
+                "message": f"  [Self-heal] Aggressively trimmed {removed} messages (prompt too long)"
+            })
+            self.conversation[:] = trimmed
+
+    def _heal_conversation(self, error_code: str = "") -> bool:
+        """Attempt to fix invalid messages in conversation.
+
+        Handles common issues that cause 'invalid messages' errors (e.g. code 1214):
+        - Empty content blocks
+        - Missing 'text' in tool_result content
+        - Consecutive same-role messages (some APIs reject these)
+        - tool_result without preceding tool_use
+
+        Returns True if any fix was applied.
+        """
+        fixed = False
+        msgs = self.conversation
+
+        # Pass 1: fix empty or malformed content in each message
+        for i, msg in enumerate(msgs):
+            content = msg.get("content")
+            role = msg.get("role", "")
+
+            # content must be a non-empty string or non-empty list
+            if content is None or content == "" or content == []:
+                msgs[i]["content"] = "(empty)"
+                fixed = True
+                continue
+
+            if isinstance(content, str) or not isinstance(content, list):
+                continue
+
+            # Fix content blocks
+            new_blocks = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+
+                btype = block.get("type", "")
+
+                # Drop empty text blocks
+                if btype == "text":
+                    text = block.get("text", "")
+                    if not text.strip():
+                        fixed = True
+                        continue
+                    new_blocks.append(block)
+
+                # Fix tool_result with missing/empty content
+                elif btype == "tool_result":
+                    tc = block.get("content")
+                    if tc is None or tc == "" or tc == []:
+                        new_blocks.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.get("tool_use_id", ""),
+                            "content": "(tool error: empty result)",
+                        })
+                        fixed = True
+                    else:
+                        new_blocks.append(block)
+
+                # Strip thinking blocks — some proxies don't support them
+                elif btype == "thinking":
+                    fixed = True
+                    continue
+
+                # Keep tool_use etc. as-is
+                else:
+                    new_blocks.append(block)
+
+            if new_blocks != content:
+                msgs[i]["content"] = new_blocks
+                fixed = True
+
+        # Pass 2: remove orphan tool_result messages (no preceding tool_use)
+        i = 0
+        while i < len(msgs):
+            content = msgs[i].get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in content
+            ):
+                # Check if previous assistant message has matching tool_use
+                has_tool_use = False
+                if i > 0 and msgs[i - 1].get("role") == "assistant":
+                    prev = msgs[i - 1].get("content")
+                    if isinstance(prev, list):
+                        has_tool_use = any(
+                            isinstance(b, dict) and b.get("type") == "tool_use"
+                            for b in prev
+                        )
+                if not has_tool_use:
+                    msgs.pop(i)
+                    fixed = True
+                    continue
+            i += 1
+
+        # Pass 3: merge consecutive same-role messages
+        merged = []
+        for msg in msgs:
+            if merged and merged[-1].get("role") == msg.get("role"):
+                prev_content = merged[-1].get("content", "")
+                cur_content = msg.get("content", "")
+                if isinstance(prev_content, str) and isinstance(cur_content, str):
+                    merged[-1]["content"] = prev_content + "\n" + cur_content
+                    fixed = True
+                    continue
+                # For list content, extend blocks
+                if isinstance(prev_content, list) and isinstance(cur_content, list):
+                    merged[-1]["content"] = prev_content + cur_content
+                    fixed = True
+                    continue
+            merged.append(msg)
+        if len(merged) != len(msgs):
+            msgs[:] = merged
+
+        # Pass 4: if still failing, drop the last assistant+user pair and retry
+        # (this is aggressive — only triggered if above fixes didn't help)
+        if not fixed and len(msgs) >= 3:
+            msgs.pop()   # last user
+            msgs.pop()   # last assistant
+            fixed = True
+
+        return fixed
 
     def _handle_event(self, event):
         """Route streaming events to the event bus."""
@@ -945,11 +1122,11 @@ class Agent:
         if name == "search_documents":
             return handle_rag_tool(tool_input, self.rag)
         if name in ("read_file", "write_file", "list_files", "search_content"):
-            return handle_file_tool(name, tool_input)
+            return handle_file_tool(name, tool_input, workspace_root=self._workspace_dir)
         if name in ("fetch_url", "web_search"):
             return handle_web_tool(name, tool_input)
         if name in ("run_command",):
-            return handle_shell_tool(name, tool_input)
+            return handle_shell_tool(name, tool_input, workspace_dir=self._workspace_dir)
         return f"Unknown tool: {name}"
 
     def _try_self_repair(self, skill, tool_name: str, tool_input: dict, error_msg: str) -> str | None:
