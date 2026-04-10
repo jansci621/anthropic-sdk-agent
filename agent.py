@@ -1510,6 +1510,33 @@ class Agent:
             "timestamp": time.time(),
         })
 
+    def _expand_rag_query(self, query: str) -> list[str]:
+        """Generate 2 alternative query phrasings to improve RAG recall.
+
+        Uses a single cheap LLM call. Returns [] on failure so retrieval
+        continues with the original query unchanged.
+        """
+        if not query or len(query) < 5:
+            return []
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=120,
+                system="You are a search query rewriter. Output ONLY the alternative queries, one per line, no numbering.",
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"Rewrite the following search query in 2 different ways "
+                        f"to improve document retrieval. Use synonyms and different "
+                        f"phrasings. Same language as the original.\n\nQuery: {query}"
+                    ),
+                }],
+            )
+            lines = [l.strip() for l in resp.content[0].text.strip().splitlines() if l.strip()]
+            return lines[:2]
+        except Exception:
+            return []
+
     def _dispatch_tool(self, name: str, tool_input: dict) -> str:
         """Route a tool call to the appropriate handler."""
         # Check skill scripts first (includes orchestrated skills)
@@ -1536,6 +1563,10 @@ class Agent:
         if name == "search_documents":
             if self.rag is None:
                 return json.dumps({"error": "RAG not available in lightweight mode"})
+            # Query expansion: generate alternative phrasings to improve recall
+            extra = self._expand_rag_query(tool_input.get("query", ""))
+            if extra:
+                tool_input = dict(tool_input, extra_queries=extra)
             return handle_rag_tool(tool_input, self.rag)
         if name in ("read_file", "write_file", "list_files", "search_content"):
             return handle_file_tool(name, tool_input, workspace_root=self._workspace_dir)
