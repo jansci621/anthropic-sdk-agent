@@ -1,16 +1,14 @@
-FROM centos:7
+FROM centos:8
 
-# ── 阿里云 YUM 源 ─────────────────────────────────────────────────────────
-RUN sed -e 's|^mirrorlist=|#mirrorlist=|g' \
-        -e 's|^#baseurl=http://mirror.centos.org|baseurl=https://mirrors.aliyun.com|g' \
-        -i.bak /etc/yum.repos.d/CentOS-Base.repo
+# ── 阿里云 vault 源（CentOS 8 EOL，官方 mirrorlist 已失效）─────────────────
+RUN sed -i 's/mirrorlist/#mirrorlist/g' /etc/yum.repos.d/CentOS-Linux-*.repo \
+    && sed -i 's|#baseurl=http://mirror.centos.org|baseurl=https://mirrors.aliyun.com/centos-vault|g' \
+           /etc/yum.repos.d/CentOS-Linux-*.repo
 
 # ── 系统依赖 ──────────────────────────────────────────────────────────────
-RUN yum makecache && yum install -y \
-        epel-release \
-        python3 python3-pip \
-        gcc gcc-c++ make \
-        && yum clean all
+RUN dnf install -y python39 python39-pip gcc gcc-c++ make && dnf clean all \
+    && alternatives --set python3 /usr/bin/python3.9 \
+    && ln -sf /usr/bin/pip3.9 /usr/bin/pip3
 
 # ── 阿里云 PyPI 源 ────────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir --upgrade pip \
@@ -24,7 +22,11 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # ── 复制项目文件 ──────────────────────────────────────────────────────────
-COPY . .
+RUN useradd -m -u 1001 agent
+
+COPY --chown=agent:agent . .
+
+USER agent
 
 # 数据目录（可通过 volume 持久化）
 VOLUME ["/app/data", "/app/knowledge_base", "/app/skills"]

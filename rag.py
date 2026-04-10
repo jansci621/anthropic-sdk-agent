@@ -1,7 +1,19 @@
-"""RAG system: document loading, chunking, embedding, and retrieval."""
+"""RAG system: document loading, chunking, embedding, and retrieval.
 
+Chunk strategy (V3):
+  1. Parse document into typed blocks (header / table / list_item / text)
+  2. Headers start a new chunk — cross-section mixing is forbidden
+  3. Tables: each chunk carries the full header row(s)
+  4. List items: lead sentence (前导句) is prepended to every item chunk
+  5. Overlap aligned to sentence boundaries; CJK-aware char→token ratio
+  6. Hybrid retrieval: dense (FAISS) + sparse (BM25) with RRF fusion
+  7. Embedding cache keyed by content hash — fast restarts
+"""
+
+import hashlib
 import json
 import os
+import re
 
 import numpy as np
 
@@ -39,10 +51,99 @@ RAG_TOOL = {
 }
 
 
+# ── File readers ─────────────────────────────────────────────────────────────
+
+def _read_text(filepath: str) -> str:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _read_pdf(filepath: str) -> str:
+    try:
+        import pypdf
+        reader = pypdf.PdfReader(filepath)
+        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+    except ImportError:
+        print("[RAG] Warning: pypdf not installed. Install with: pip install pypdf")
+        return ""
+
+
+def _read_json(filepath: str) -> str:
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _read_csv(filepath: str) -> str:
+    import csv
+    rows: list[str] = []
+    with open(filepath, "r", encoding="utf-8", newline="") as f:
+        for row in csv.reader(f):
+            rows.append(" | ".join(row))
+    return "\n".join(rows)
+
+
+_FILE_READERS: dict[str, object] = {
+    ".txt": _read_text,
+    ".md":  _read_text,
+    ".pdf": _read_pdf,
+    ".json": _read_json,
+    ".csv": _read_csv,
+}
+
+
+# ── Structure detection helpers ───────────────────────────────────────────────
+
+# Markdown headers and Chinese section numbering systems
+_HEADER_RE = re.compile(
+    r'^(?:'
+    r'#{1,6}\s'                                    # ## Markdown header
+    r'|第[一二三四五六七八九十百\d]+[章条节篇]'      # 第X章/条/节
+    r'|\d+\.\s+[\u4e00-\u9fa5A-Z]'                # 1. Title
+    r'|\d+\.\d+\s'                                 # 1.1 subsection
+    r'|（[一二三四五六七八九十]+）[\u4e00-\u9fa5]'  # （一）中文
+    r')'
+)
+
+# List items: （1） ① 1. 1、 (a)
+_LIST_ITEM_RE = re.compile(
+    r'^(?:（\d+）|[①②③④⑤⑥⑦⑧⑨⑩]|\d+[\.、]\s|\([a-z]\)\s)'
+)
+
+# Lead sentence ending with colon or Chinese colon, or containing 以下/下列/包括 etc.
+_LIST_INTRO_RE = re.compile(
+    r'(?:以下|下列|如下|包括|包含|范围|情形|情况)[^：:]*[：:]?\s*$'
+    r'|[：:]\s*$'
+)
+
+# Markdown table row
+_TABLE_ROW_RE = re.compile(r'^\|.+\|')
+# Markdown table separator row
+_TABLE_SEP_RE = re.compile(r'^\|[\s\-\|:]+\|')
+
+
+def _is_header(line: str) -> bool:
+    return bool(_HEADER_RE.match(line.strip()))
+
+
+def _is_list_item(line: str) -> bool:
+    return bool(_LIST_ITEM_RE.match(line.strip()))
+
+
+def _is_list_intro(line: str) -> bool:
+    return bool(_LIST_INTRO_RE.search(line.strip()))
+
+
+def _is_table_row(line: str) -> bool:
+    return bool(_TABLE_ROW_RE.match(line.strip()))
+
+
 # ── RAG System ──────────────────────────────────────────────────────────────
 
 class RAGSystem:
-    """Document retrieval using local sentence embeddings and FAISS."""
+    """Document retrieval using local sentence embeddings and FAISS + BM25."""
+
+    _CACHE_SUBDIR = ".rag_cache"
 
     def __init__(
         self,
@@ -53,14 +154,15 @@ class RAGSystem:
         top_k: int = config.TOP_K_RESULTS,
     ):
         self.knowledge_base_dir = knowledge_base_dir
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.chunk_size = chunk_size        # in tokens
+        self.chunk_overlap = chunk_overlap  # in tokens
         self.top_k = top_k
+        self._cache_dir = os.path.join(knowledge_base_dir, self._CACHE_SUBDIR)
 
-        # Will be populated by _load_and_index
         self.chunks: list[dict] = []
         self.embeddings: np.ndarray | None = None
-        self.index = None  # FAISS index or numpy fallback
+        self.index = None   # FAISS or None
+        self._bm25 = None   # rank_bm25.BM25Okapi or None
 
         print(f"[RAG] Loading documents from {knowledge_base_dir} ...")
         self.model = self._load_embedding_model(embedding_model)
@@ -70,121 +172,375 @@ class RAGSystem:
     # ── Public API ───────────────────────────────────────────────────────
 
     def search(self, query: str, top_k: int | None = None) -> list[dict]:
-        """Search for relevant document chunks."""
+        """Hybrid dense + BM25 retrieval with RRF fusion."""
         if not self.chunks or self.embeddings is None:
-            return [{"text": "No documents have been indexed in the knowledge base.", "source": "system"}]
+            return [{"text": "No documents indexed.", "source": "system"}]
 
-        k = top_k or self.top_k
-        k = min(k, len(self.chunks))
+        k = min(top_k or self.top_k, len(self.chunks))
+        candidates_k = min(k * 3, len(self.chunks))
 
-        query_emb = self.model.encode([query], normalize_embeddings=True)
-        query_vec = np.array(query_emb, dtype=np.float32)
-
+        # ── Dense retrieval ────────────────────────────────────────────
+        query_vec = np.array(
+            self.model.encode([query], normalize_embeddings=True), dtype=np.float32
+        )
+        dense_scores: dict[int, float] = {}
         if self.index is not None:
-            # FAISS search
-            scores, indices = self.index.search(query_vec, k)
-            results = []
-            for score, idx in zip(scores[0], indices[0]):
-                if idx < 0:
-                    continue
-                chunk = self.chunks[idx].copy()
-                chunk["score"] = float(score)
-                results.append(chunk)
-            return results
+            scores, indices = self.index.search(query_vec, candidates_k)
+            for s, i in zip(scores[0], indices[0]):
+                if i >= 0:
+                    dense_scores[int(i)] = float(s)
         else:
-            # Numpy fallback (cosine similarity via dot product on normalized vectors)
-            scores = np.dot(self.embeddings, query_vec.T).flatten()
-            top_indices = np.argsort(scores)[::-1][:k]
-            results = []
-            for idx in top_indices:
-                chunk = self.chunks[idx].copy()
-                chunk["score"] = float(scores[idx])
-                results.append(chunk)
-            return results
+            raw = np.dot(self.embeddings, query_vec.T).flatten()
+            for i in np.argsort(raw)[::-1][:candidates_k]:
+                dense_scores[int(i)] = float(raw[i])
+
+        # ── Sparse BM25 retrieval ──────────────────────────────────────
+        bm25_scores: dict[int, float] = {}
+        if self._bm25 is not None:
+            raw_bm25 = self._bm25.get_scores(self._tokenize(query))
+            top_bm25 = np.argsort(raw_bm25)[::-1][:candidates_k]
+            max_val = raw_bm25[top_bm25[0]] if raw_bm25[top_bm25[0]] > 0 else 1.0
+            for i in top_bm25:
+                bm25_scores[int(i)] = float(raw_bm25[i]) / max_val
+
+        # ── RRF fusion ─────────────────────────────────────────────────
+        # Normalize dense scores to [0, 1]
+        if dense_scores:
+            lo, hi = min(dense_scores.values()), max(dense_scores.values())
+            span = hi - lo or 1.0
+            dense_norm = {i: (s - lo) / span for i, s in dense_scores.items()}
+        else:
+            dense_norm = {}
+
+        all_ids = set(dense_norm) | set(bm25_scores)
+        fused = {
+            i: 0.6 * dense_norm.get(i, 0.0) + 0.4 * bm25_scores.get(i, 0.0)
+            for i in all_ids
+        }
+
+        top_ids = sorted(fused, key=lambda i: fused[i], reverse=True)[:k]
+        results = []
+        for i in top_ids:
+            chunk = self.chunks[i].copy()
+            chunk["score"] = round(fused[i], 4)
+            results.append(chunk)
+        return results
 
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _load_embedding_model(self, model_name: str):
-        """Load sentence-transformers model."""
         try:
             from sentence_transformers import SentenceTransformer
             return SentenceTransformer(model_name)
         except ImportError:
-            print("[RAG] Warning: sentence-transformers not installed. RAG will not work.")
+            print("[RAG] Warning: sentence-transformers not installed.")
             return None
 
     def _load_and_index(self):
-        """Load all documents, chunk them, embed, and build the search index."""
         if self.model is None:
             return
-
-        # Collect chunks from all supported files
-        all_chunks: list[dict] = []
         if not os.path.isdir(self.knowledge_base_dir):
             os.makedirs(self.knowledge_base_dir, exist_ok=True)
             return
 
+        # Read all supported files
+        file_contents: dict[str, str] = {}
         for filename in sorted(os.listdir(self.knowledge_base_dir)):
             filepath = os.path.join(self.knowledge_base_dir, filename)
             if not os.path.isfile(filepath):
                 continue
-
             ext = os.path.splitext(filename)[1].lower()
-            if ext not in (".txt", ".md"):
+            reader = _FILE_READERS.get(ext)
+            if reader is None:
                 continue
-
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    text = f.read()
-            except OSError as e:
+                text = reader(filepath)  # type: ignore[operator]
+            except Exception as e:
                 print(f"[RAG] Warning: could not read {filename}: {e}")
                 continue
+            if text.strip():
+                file_contents[filename] = text
 
-            chunks = self._chunk_text(text, source_file=filename)
-            all_chunks.extend(chunks)
-
-        if not all_chunks:
+        if not file_contents:
             return
 
+        # Check cache
+        content_hash = self._compute_hash(file_contents)
+        cached = self._load_cache(content_hash)
+        if cached:
+            self.chunks, self.embeddings = cached
+            self._build_index()
+            self._build_bm25()
+            print(f"[RAG] Loaded from cache ({content_hash[:8]}).")
+            return
+
+        # Build fresh
+        all_chunks: list[dict] = []
+        for filename, text in file_contents.items():
+            all_chunks.extend(self._chunk_text(text, source_file=filename))
+
         self.chunks = all_chunks
-
-        # Encode all chunks
         texts = [c["text"] for c in all_chunks]
-        embeddings = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        self.embeddings = np.array(embeddings, dtype=np.float32)
+        self.embeddings = np.array(
+            self.model.encode(texts, normalize_embeddings=True, show_progress_bar=True),
+            dtype=np.float32,
+        )
+        self._build_index()
+        self._build_bm25()
+        self._save_cache(content_hash)
 
-        # Build FAISS index (with numpy fallback)
+    def _build_index(self):
         try:
             import faiss
             dim = self.embeddings.shape[1]
             self.index = faiss.IndexFlatIP(dim)
             self.index.add(self.embeddings)
         except ImportError:
-            print("[RAG] FAISS not available, using numpy fallback for similarity search.")
+            print("[RAG] FAISS not available, using numpy fallback.")
             self.index = None
 
+    def _build_bm25(self):
+        try:
+            from rank_bm25 import BM25Okapi
+            tokenized = [self._tokenize(c["text"]) for c in self.chunks]
+            self._bm25 = BM25Okapi(tokenized)
+        except ImportError:
+            print("[RAG] rank_bm25 not available, skipping sparse retrieval.")
+            self._bm25 = None
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """CJK single-char + ASCII word tokenization."""
+        return re.findall(r'[\u4e00-\u9fff\u3400-\u4dbf]|[a-zA-Z0-9]+', text.lower()) or [text]
+
+    # ── Chunking (V3) ────────────────────────────────────────────────────
+
+    def _chars_per_token(self, text: str) -> float:
+        """CJK-aware char-to-token ratio: ~2 chars/token for Chinese, ~4 for English."""
+        cjk = len(re.findall(r'[\u4e00-\u9fff]', text))
+        ratio = cjk / max(len(text), 1)
+        return 2.0 if ratio > 0.3 else 4.0
+
+    def _parse_blocks(self, text: str) -> list[dict]:
+        """Parse raw text into typed semantic blocks."""
+        lines = text.split("\n")
+        blocks: list[dict] = []
+        pending_intro: str | None = None
+        i = 0
+
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+
+            if not stripped:
+                i += 1
+                continue
+
+            # ── Markdown table ───────────────────────────────────────
+            if _is_table_row(stripped):
+                table_lines: list[str] = []
+                while i < len(lines) and (
+                    _is_table_row(lines[i].strip()) or _TABLE_SEP_RE.match(lines[i].strip())
+                ):
+                    table_lines.append(lines[i])
+                    i += 1
+                blocks.append({"type": "table", "lines": table_lines})
+                pending_intro = None
+                continue
+
+            # ── Section header ───────────────────────────────────────
+            if _is_header(stripped):
+                blocks.append({"type": "header", "text": stripped})
+                pending_intro = None
+                i += 1
+                continue
+
+            # ── List item ────────────────────────────────────────────
+            if _is_list_item(stripped):
+                intro = (pending_intro + "\n") if pending_intro else ""
+                blocks.append({"type": "list_item", "text": (intro + stripped).strip()})
+                i += 1
+                continue
+
+            # ── Regular paragraph (collect until blank / structure change) ──
+            para_lines = [stripped]
+            i += 1
+            while i < len(lines):
+                ns = lines[i].strip()
+                if not ns:
+                    i += 1
+                    break
+                if _is_header(ns) or _is_table_row(ns) or _is_list_item(ns):
+                    break
+                para_lines.append(ns)
+                i += 1
+
+            para = " ".join(para_lines)
+            if _is_list_intro(para):
+                pending_intro = para
+            else:
+                pending_intro = None
+            blocks.append({"type": "text", "text": para})
+
+        return blocks
+
+    def _align_overlap(self, text: str, overlap_chars: int) -> str:
+        """Trim overlap to a sentence boundary so we don't split mid-sentence."""
+        if not text or overlap_chars <= 0:
+            return ""
+        tail = text[-overlap_chars:]
+        # Find first sentence start after the cut point
+        m = re.search(r'(?<=[。！？.!?])\s*\S', tail)
+        return tail[m.start():].strip() if m else tail.strip()
+
     def _chunk_text(self, text: str, source_file: str) -> list[dict]:
-        """Split text into overlapping chunks of approximately chunk_size tokens."""
-        # Simple heuristic: ~4 characters per token
-        chars_per_chunk = self.chunk_size * 4
-        overlap_chars = self.chunk_overlap * 4
+        """V3 semantic chunking: structure-aware, table-header-preserving, intro-copying."""
+        cpt = self._chars_per_token(text)
+        max_chars = int(self.chunk_size * cpt)
+        overlap_chars = int(self.chunk_overlap * cpt)
 
-        chunks = []
-        start = 0
+        blocks = self._parse_blocks(text)
+        chunks: list[dict] = []
         idx = 0
-        while start < len(text):
-            end = start + chars_per_chunk
-            chunk_text = text[start:end].strip()
-            if chunk_text:
-                chunks.append({
-                    "text": chunk_text,
-                    "source": source_file,
-                    "chunk_index": idx,
-                })
-                idx += 1
-            start += chars_per_chunk - overlap_chars
+        current = ""
+        last_header = ""
 
+        def flush(extra: str = "") -> str:
+            nonlocal idx
+            body = (current + ("\n" + extra if extra else "")).strip()
+            if body:
+                chunks.append({"text": body, "source": source_file, "chunk_index": idx})
+                idx += 1
+            return body
+
+        for block in blocks:
+            btype = block["type"]
+
+            # ── Header: always start a fresh chunk ───────────────────
+            if btype == "header":
+                flush()
+                last_header = block["text"]
+                current = last_header + "\n"
+                continue
+
+            # ── Table: split rows while preserving header ─────────────
+            if btype == "table":
+                flush()
+                current = last_header + "\n" if last_header else ""
+
+                tlines = block["lines"]
+                # Separate header rows from data rows
+                header_rows: list[str] = []
+                data_rows: list[str] = []
+                sep_seen = False
+                for tl in tlines:
+                    if _TABLE_SEP_RE.match(tl.strip()):
+                        header_rows.append(tl)
+                        sep_seen = True
+                    elif not sep_seen:
+                        header_rows.append(tl)
+                    else:
+                        data_rows.append(tl)
+
+                if not data_rows:
+                    # No separator found — treat entire table as text block
+                    current = "\n".join(tlines)
+                    continue
+
+                tbl_header = "\n".join(header_rows)
+                tbl_header_len = len(tbl_header)
+                bucket: list[str] = []
+                bucket_len = tbl_header_len
+
+                for row in data_rows:
+                    row_len = len(row)
+                    if bucket_len + row_len > max_chars and bucket:
+                        tbl_chunk = tbl_header + "\n" + "\n".join(bucket)
+                        chunks.append({"text": tbl_chunk, "source": source_file,
+                                       "chunk_index": idx, "chunk_type": "table"})
+                        idx += 1
+                        bucket, bucket_len = [], tbl_header_len
+                    bucket.append(row)
+                    bucket_len += row_len
+
+                if bucket:
+                    tbl_chunk = tbl_header + "\n" + "\n".join(bucket)
+                    chunks.append({"text": tbl_chunk, "source": source_file,
+                                   "chunk_index": idx, "chunk_type": "table"})
+                    idx += 1
+                current = (last_header + "\n") if last_header else ""
+                continue
+
+            # ── Text / list_item ──────────────────────────────────────
+            block_text = block["text"]
+
+            if len(current) + len(block_text) + 1 <= max_chars:
+                current = (current + "\n" + block_text).strip() + "\n"
+            else:
+                # Flush and start a new chunk with overlap
+                flushed = flush()
+                overlap = self._align_overlap(flushed, overlap_chars)
+                header_ctx = (last_header + "\n").strip() if last_header else ""
+                current = (header_ctx + "\n" + overlap + "\n" + block_text).strip() + "\n"
+
+                # If a single block still exceeds max_chars, split by sentences
+                if len(current) > max_chars:
+                    sentences = re.split(r'(?<=[。！？.!?\n])', block_text)
+                    current = header_ctx + "\n" if header_ctx else ""
+                    for sent in sentences:
+                        sent = sent.strip()
+                        if not sent:
+                            continue
+                        if len(current) + len(sent) <= max_chars:
+                            current = (current + sent).strip() + " "
+                        else:
+                            flushed = flush()
+                            overlap = self._align_overlap(flushed, overlap_chars)
+                            current = (overlap + " " + sent).strip() + " "
+                    current = current.strip() + "\n"
+
+        flush()
         return chunks
+
+    # ── Embedding cache ───────────────────────────────────────────────────
+
+    def _compute_hash(self, file_contents: dict[str, str]) -> str:
+        h = hashlib.md5()
+        for name in sorted(file_contents):
+            h.update(name.encode())
+            h.update(file_contents[name].encode())
+        h.update(str(self.chunk_size).encode())
+        h.update(str(self.chunk_overlap).encode())
+        return h.hexdigest()
+
+    def _cache_paths(self, content_hash: str) -> tuple[str, str]:
+        os.makedirs(self._cache_dir, exist_ok=True)
+        return (
+            os.path.join(self._cache_dir, f"{content_hash}.npz"),
+            os.path.join(self._cache_dir, f"{content_hash}.json"),
+        )
+
+    def _load_cache(self, content_hash: str) -> tuple[list[dict], np.ndarray] | None:
+        emb_path, chunks_path = self._cache_paths(content_hash)
+        if not (os.path.exists(emb_path) and os.path.exists(chunks_path)):
+            return None
+        try:
+            embeddings = np.load(emb_path)["embeddings"]
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            return chunks, embeddings
+        except Exception as e:
+            print(f"[RAG] Cache load failed ({e}), rebuilding.")
+            return None
+
+    def _save_cache(self, content_hash: str):
+        emb_path, chunks_path = self._cache_paths(content_hash)
+        try:
+            np.savez_compressed(emb_path, embeddings=self.embeddings)
+            with open(chunks_path, "w", encoding="utf-8") as f:
+                json.dump(self.chunks, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"[RAG] Cache save failed: {e}")
 
 
 # ── Tool Dispatch ───────────────────────────────────────────────────────────

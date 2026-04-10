@@ -186,6 +186,8 @@ let currentAssistantEl = null;
 let currentPhase = null;
 let thinkingEl = null;
 let textEl = null;
+let thinkingAccumulating = false;
+let textAccumulating = false;
 let toolEl = null;
 let toolPartialJson = "";
 let isProcessing = false;
@@ -434,6 +436,7 @@ function handleEvent(data) {
       thinkingEl.appendChild(tPre);
       currentAssistantEl.appendChild(thinkingEl);
       currentPhase = "thinking";
+      thinkingAccumulating = false;
       scrollBottom();
       break;
 
@@ -441,12 +444,17 @@ function handleEvent(data) {
       if (thinkingEl) {
         const tPre = thinkingEl.querySelector("pre");
         const tNew = data.text || "";
-        const tCur = tPre.textContent;
-        // Handle proxies that send accumulated text instead of incremental deltas
-        if (tCur.length > 0 && tNew.length >= tCur.length && tNew.startsWith(tCur)) {
-          tPre.textContent = tNew;
+        // Detect proxy mode once (accumulated vs incremental), then skip the check
+        if (!thinkingAccumulating) {
+          const tCur = tPre.textContent;
+          if (tCur.length > 0 && tNew.length >= tCur.length && tNew.startsWith(tCur)) {
+            thinkingAccumulating = true;
+            tPre.textContent = tNew;
+          } else {
+            tPre.textContent += tNew;
+          }
         } else {
-          tPre.textContent += tNew;
+          tPre.textContent = tNew;
         }
         scrollBottom();
       }
@@ -463,18 +471,24 @@ function handleEvent(data) {
       textEl.className = "assistant-text";
       currentAssistantEl.appendChild(textEl);
       currentPhase = "text";
+      textAccumulating = false;
       scrollBottom();
       break;
 
     case "text_delta":
       if (textEl) {
         const newText = data.text || "";
-        const curText = textEl.textContent;
-        // Handle proxies that send accumulated text instead of incremental deltas
-        if (curText.length > 0 && newText.length >= curText.length && newText.startsWith(curText)) {
-          textEl.textContent = newText;
+        // Detect proxy mode once (accumulated vs incremental), then skip the check
+        if (!textAccumulating) {
+          const curText = textEl.textContent;
+          if (curText.length > 0 && newText.length >= curText.length && newText.startsWith(curText)) {
+            textAccumulating = true;
+            textEl.textContent = newText;
+          } else {
+            textEl.textContent += newText;
+          }
         } else {
-          textEl.textContent += newText;
+          textEl.textContent = newText;
         }
         scrollBottom();
       }

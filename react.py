@@ -115,7 +115,7 @@ class ReActLoop:
         tools: list[dict],
         tool_dispatcher: Callable[[str, dict], str],
         thinking_config: dict | None = None,
-        max_tokens: int = 16000,
+        max_tokens: int = config.MAX_TOKENS,
         event_bus=None,
     ):
         self.client = client
@@ -125,7 +125,6 @@ class ReActLoop:
         self.thinking_config = thinking_config
         self.max_tokens = max_tokens
         self.event_bus = event_bus
-        self._current_block_type: str | None = None
 
     def _emit(self, event_type: str, data: dict | None = None):
         """Emit an event through the event bus (if configured)."""
@@ -150,6 +149,7 @@ class ReActLoop:
         """
         trace = ReActTrace(query=query)
         messages: list[dict] = [{"role": "user", "content": query}]
+        nudge_count = 0
 
         self._print_header(query)
 
@@ -181,9 +181,14 @@ class ReActLoop:
                 # inside thinking blocks instead of making actual tool_use blocks.
                 # Nudge the model to respond properly and retry this step.
                 if not step.final_answer.strip():
+                    nudge_count += 1
+                    if nudge_count > 3:
+                        trace.final_answer = "[ReAct terminated: model returned empty response repeatedly]"
+                        trace.total_turns = step_num
+                        return trace.final_answer, trace
                     print(
                         f"\n{config.COLOR_SYSTEM}[ReAct] Step {step_num}: empty response, "
-                        f"nudging model to retry...{config.COLOR_RESET}"
+                        f"nudging model to retry ({nudge_count}/3)...{config.COLOR_RESET}"
                     )
                     # Remove the empty assistant turn we just appended
                     messages.pop()
@@ -290,10 +295,11 @@ class ReActLoop:
             # Reset per attempt so a partial stream from a failed attempt
             # does not corrupt the thought trace on retry.
             thought_parts: list[str] = []
+            current_block: list[str | None] = [None]
             try:
                 with self.client.messages.stream(**kwargs) as stream:
                     for event in stream:
-                        self._handle_stream_event(event, thought_parts, step)
+                        self._handle_stream_event(event, thought_parts, step, current_block)
 
                     message = stream.get_final_message()
                     step.thought = "\n".join(thought_parts).strip()
@@ -326,11 +332,12 @@ class ReActLoop:
         event,
         thought_parts: list[str],
         step: ReActStep,
+        current_block: list[str | None],
     ):
         """Route stream events to their correct ReAct phase output."""
         if event.type == "content_block_start":
             block = event.content_block
-            self._current_block_type = block.type
+            current_block[0] = block.type
             if block.type == "thinking":
                 self._emit(EVENT_REACT_STEP_START, {"step_num": step.step_num})
                 self._emit(EVENT_THINKING_START)
@@ -353,16 +360,13 @@ class ReActLoop:
                 self._emit(EVENT_TOOL_CALL_DELTA, {"partial_json": delta.partial_json})
 
         elif event.type == "content_block_stop":
-            if self._current_block_type == "thinking":
+            if current_block[0] == "thinking":
                 self._emit(EVENT_THINKING_END)
-            elif self._current_block_type == "text":
+            elif current_block[0] == "text":
                 self._emit(EVENT_TEXT_END)
-            elif self._current_block_type == "tool_use":
+            elif current_block[0] == "tool_use":
                 self._emit(EVENT_TOOL_CALL_END)
-            self._current_block_type = None
-
-        elif event.type == "content_block_stop":
-            pass  # _end events emitted by CLIPrintSink or handled by caller
+            current_block[0] = None
 
     # ── Tool Execution ────────────────────────────────────────────────────
 

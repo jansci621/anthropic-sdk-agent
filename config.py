@@ -80,7 +80,7 @@ _THINKING_UNSUPPORTED = {"deepseek", "together", "anyscale"}
 THINKING_ENABLED = PROVIDER not in _THINKING_UNSUPPORTED and os.environ.get("AI_THINKING", "true").lower() != "false"
 THINKING_CONFIG = {"type": "adaptive"} if THINKING_ENABLED else None
 
-MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "128000"))
+MAX_TOKENS = int(os.environ.get("AI_MAX_TOKENS", "64000"))
 
 # Auto-routing: automatically choose between ReAct and general agent mode.
 # Set AI_AUTO_ROUTE=false to disable (always use general agent mode).
