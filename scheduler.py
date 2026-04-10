@@ -86,14 +86,32 @@ class TaskScheduler:
     def __init__(self):
         self._scheduler = BackgroundScheduler(timezone="UTC")
         self._tasks: dict[str, ScheduledTask] = {}
-        self._exec_lock = threading.Lock()   # prevents concurrent task execution
+        self._exec_lock = threading.Lock()     # prevents concurrent scheduler task execution
+        self._init_lock = threading.Lock()     # protects lazy sched_agent initialization
         self._agent_getter: Callable | None = None
         self._session_updater: Callable | None = None  # (session_id, task_name, events) -> None
+        self._sched_agent = None   # lazy-init lightweight agent for scheduler tasks
+        self._sched_bus = None
         self._load_tasks()
 
     def set_agent_getter(self, getter: Callable):
         """Provide a callable that returns (Agent, EventBus) — called by web_server / main."""
         self._agent_getter = getter
+
+    def _get_sched_agent(self):
+        """Get (or lazily create) the scheduler's own lightweight Agent.
+        Protected by _exec_lock so only one thread initialises it.
+        """
+        with self._init_lock:
+            if self._sched_agent is None:
+                from agent import Agent
+                from event_bus import EventBus, CLIPrintSink
+                bus = EventBus()
+                bus.add_sink(CLIPrintSink())
+                self._sched_agent = Agent(event_bus=bus, lightweight=True)
+                self._sched_bus = bus
+                log.info("[Scheduler] Lightweight agent created.")
+            return self._sched_agent, self._sched_bus
 
     def set_session_updater(self, fn: Callable):
         """Register callback: fn(session_id, task_name, events) → None.
@@ -259,12 +277,13 @@ class TaskScheduler:
         task.last_run = datetime.now(timezone.utc).isoformat()
         print(f"\n{config.COLOR_SYSTEM}[Scheduler] ▶ Running: {task.name}{config.COLOR_RESET}")
 
-        agent, bus = self._agent_getter()
-        # 获取 agent 执行锁，与用户会话串行，防止并发修改 agent.conversation
+        # Use the scheduler's own lightweight agent — completely independent from
+        # user session agents, so no _execution_lock coordination needed.
+        agent, bus = self._get_sched_agent()
         captured: list[dict] = []
         ok = True
         err_msg = ""
-        with self._exec_lock, agent._execution_lock:
+        with self._exec_lock:
             capture = _CaptureSink()
             bus.add_sink(capture)
             try:

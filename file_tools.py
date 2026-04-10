@@ -206,11 +206,12 @@ def _list_files(pattern: str, path: str = ".", workspace_root: str | None = None
         matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
         return [os.path.relpath(m, abs_base) for m in matches[:100]]
 
+    ex = _cf.ThreadPoolExecutor(max_workers=1)
     try:
-        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_do_glob)
-            results = future.result(timeout=8)
+        future = ex.submit(_do_glob)
+        results = future.result(timeout=8)
     except _cf.TimeoutError:
+        ex.shutdown(wait=False)  # don't block; background thread is daemon and will die with process
         return json.dumps(
             {
                 "error": (
@@ -220,6 +221,8 @@ def _list_files(pattern: str, path: str = ".", workspace_root: str | None = None
             },
             ensure_ascii=False,
         )
+    finally:
+        ex.shutdown(wait=False)
 
     return json.dumps(
         {"base": abs_base, "pattern": pattern, "count": len(results), "files": results},

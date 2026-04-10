@@ -6,6 +6,50 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
+
+from contextlib import contextmanager
+import threading as _threading_module
+
+
+@contextmanager
+def _lock_released(lock: _threading_module.Lock):
+    """Temporarily release a threading.Lock, then unconditionally re-acquire it.
+    Safer than manual release()/acquire() because re-acquire is guaranteed even
+    on BaseException (KeyboardInterrupt, thread cancellation, etc.).
+    """
+    lock.release()
+    try:
+        yield
+    finally:
+        lock.acquire()
+
+
+class _Noop:
+    """Silent no-op stub used in lightweight agent mode.
+    Any attribute access returns a callable that does nothing and returns None/empty.
+    """
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+    def __bool__(self):
+        return False
+
+    # Common return-value shapes expected by agent code
+    def retrieve(self, *a, **kw):
+        return []
+
+    def format_for_prompt(self, *a, **kw):
+        return ""
+
+    def load(self, *a, **kw):
+        return ""
+
+    def fast_match(self, *a, **kw):
+        return None
+
+    def should_reflect(self, *a, **kw):
+        return False
+
 import anthropic
 
 import config
@@ -47,7 +91,12 @@ class Agent:
         base_url: str | None = None,
         system_prompt: str = config.SYSTEM_PROMPT,
         event_bus: 'EventBus | None' = None,
+        lightweight: bool = False,
     ):
+        """
+        lightweight=True: skip RAG/skills/evolution subsystems.
+        Use for the scheduler's dedicated agent to avoid expensive initialization.
+        """
         # Execution lock — prevents concurrent _agent_loop calls from scheduler + web sessions
         import threading as _threading
         self._execution_lock = _threading.Lock()
@@ -85,19 +134,22 @@ class Agent:
 
         # Sub-systems
         self.memory = MemoryStore()
-        self.rag = RAGSystem()
+        _noop = _Noop()
+        self.rag = RAGSystem() if not lightweight else None
         self.repair_agent = RepairAgent(self.client)
         self.script_repairer = ScriptRepairer(self.client)
-        self.experience = ExperienceStore()
-        self.prompt_evolution = PromptEvolution(self.client)
-        self.tool_stats = ToolStats()
-        self.reflexion = ReflexionAgent(self.client)
-        self.fast_rules = FastRuleEngine()
-        # E6: share the same ExperienceStore instance across all co-evolution agents
-        self.co_evolution = CoEvolutionCoordinator(self.client, pool=self.experience)
+        self.experience = ExperienceStore() if not lightweight else _noop
+        self.prompt_evolution = PromptEvolution(self.client) if not lightweight else _noop
+        self.tool_stats = ToolStats() if not lightweight else _noop
+        self.reflexion = ReflexionAgent(self.client) if not lightweight else _noop
+        self.fast_rules = FastRuleEngine() if not lightweight else _noop
+        self.co_evolution = (
+            CoEvolutionCoordinator(self.client, pool=self.experience)
+            if not lightweight else _noop
+        )
 
         # Skills
-        self.skills = discover_skills(config.SKILLS_DIR)
+        self.skills = discover_skills(config.SKILLS_DIR) if not lightweight else {}
 
         # ReAct loop (lazy-init, shares client / tools / dispatcher)
         self._react_loop: ReActLoop | None = None
@@ -119,7 +171,9 @@ class Agent:
 
         # Tools: base tools + skill scripts
         skill_tools = [t for s in self.skills.values() for t in s.tools]
-        self.tools = [*MEMORY_TOOLS, RAG_TOOL, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
+        # RAG tool only available when RAG is loaded (not in lightweight mode)
+        _rag_tools = [RAG_TOOL] if self.rag is not None else []
+        self.tools = [*MEMORY_TOOLS, *_rag_tools, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
 
         # System prompt: base + CLAUDE.md + skill prompts + references
         self.system = self._build_system_prompt(system_prompt)
@@ -636,16 +690,19 @@ class Agent:
 
             if message.stop_reason == "tool_use":
                 tool_use_blocks = [b for b in message.content if b.type == "tool_use"]
-                tool_results = self._execute_tools(tool_use_blocks)
 
-                # L4: retry budget — detect repeated failures on same call
-                tool_results = self._check_retry_budget(tool_use_blocks, tool_results)
+                # Release execution lock during tool I/O — allows scheduler to run
+                # between tool calls without blocking the entire agent loop.
+                # _lock_released guarantees re-acquire even on BaseException.
+                with _lock_released(self._execution_lock):
+                    tool_results = self._execute_tools(tool_use_blocks)
+                    tool_results = self._check_retry_budget(tool_use_blocks, tool_results)
+                    has_error = any(
+                        "error" in str(r.get("content", "")).lower()[:200]
+                        for r in tool_results
+                    )
 
-                # L5: check consecutive errors for rollback
-                has_error = any(
-                    "error" in str(r.get("content", "")).lower()[:200]
-                    for r in tool_results
-                )
+                # Back under lock — safe to modify conversation
                 if has_error:
                     self._consecutive_errors += 1
                     if self._consecutive_errors >= self._MAX_CONSECUTIVE_ERRORS:
@@ -760,11 +817,42 @@ class Agent:
                 cleaned.append(msg)
         return cleaned
 
-    _MAX_CONVERSATION_PAIRS = 40  # keep last N user/assistant pairs
+    _MAX_CONVERSATION_PAIRS = 40   # hard trim upper bound
+    _ZONE_RECENT  = 10             # L0: keep verbatim
+    _ZONE_MIDDLE  = 20             # L1: prose summary
+    # L2 (everything older): keyword digest + save to memory
+    _COMPRESS_THRESHOLD = _ZONE_RECENT + _ZONE_MIDDLE  # 30 pairs before compression kicks in
+    _COMPRESS_KEEP_RECENT = _ZONE_RECENT
+    _CHARS_PER_TOKEN = 2.5
+
+    # ── Token estimation ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _est_tokens(obj) -> int:
+        """Rough token count for a message or list of messages."""
+        if isinstance(obj, str):
+            return max(1, int(len(obj) / 2.5))
+        if isinstance(obj, list):
+            return sum(Agent._est_tokens(b) for b in obj)
+        if isinstance(obj, dict):
+            t = obj.get("type", "")
+            if t == "thinking":
+                # thinking blocks are large but stripped before API call
+                return int(len(obj.get("thinking", "")) / 2.5)
+            if t == "text":
+                return max(1, int(len(obj.get("text", "")) / 2.5))
+            # tool_use / tool_result
+            return max(1, int(len(str(obj)) / 2.5))
+        return 1
+
+    def _conversation_tokens(self) -> int:
+        return sum(self._est_tokens(m.get("content", "")) for m in self.conversation)
 
     def _stream_response(self, max_retries: int = 10) -> anthropic.types.Message:
         """Stream a response with exponential backoff on retryable errors."""
-        # Trim old conversation to prevent context overflow
+        # P0: strip thinking blocks from stored history (they can be thousands of tokens)
+        self._strip_thinking_from_history()
+        # Trim / compress old conversation to stay within context window limits
         self._trim_conversation()
 
         stream_kwargs = {
@@ -844,30 +932,238 @@ class Agent:
                 })
                 time.sleep(wait)
 
-    def _trim_conversation(self):
-        """Trim old conversation pairs to stay within context window limits.
+    # ── P0: Strip thinking from stored history ───────────────────────────────
 
-        Keeps the first user message (task context) and the last N pairs.
+    def _strip_thinking_from_history(self):
+        """Remove thinking blocks from assistant messages already in history.
+
+        thinking blocks are only useful in the current turn (for multi-step tool
+        calls within one response). Once the turn is complete they consume tokens
+        without adding value to future turns — strip them eagerly.
         """
-        if len(self.conversation) <= self._MAX_CONVERSATION_PAIRS * 2:
+        for msg in self.conversation:
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            new_content = [
+                b for b in content
+                if not (isinstance(b, dict) and b.get("type") == "thinking")
+            ]
+            if len(new_content) != len(content):
+                msg["content"] = new_content
+
+    # ── P1 + P2: Hierarchical compression + memory extraction ───────────────
+
+    def _trim_conversation(self):
+        """Hierarchical conversation compression.
+
+        Three zones:
+          L0 Recent  (last _ZONE_RECENT  pairs) → kept verbatim
+          L1 Middle  (prev _ZONE_MIDDLE  pairs) → prose summary
+          L2 Old     (everything older)         → keyword digest + save to memory
+
+        Structure after compression:
+          [first_user anchor]
+          [L2 keyword digest message]   ← injected as user context
+          [L1 prose summary message]    ← injected as assistant
+          [L0 recent verbatim messages]
+        """
+        pairs = len(self.conversation) // 2
+        if pairs <= self._COMPRESS_THRESHOLD:
             return
 
-        # Preserve the first user message for task context
+        recent_n   = self._ZONE_RECENT  * 2
+        middle_n   = self._ZONE_MIDDLE  * 2
+
+        recent_msgs = self.conversation[-recent_n:]
+        pre_recent  = self.conversation[:-recent_n]
+
+        if not pre_recent:
+            return  # not enough history yet
+
+        # Split pre_recent into middle + old zones
+        if len(pre_recent) > middle_n:
+            old_msgs    = pre_recent[:-middle_n]
+            middle_msgs = pre_recent[-middle_n:]
+        else:
+            old_msgs    = []
+            middle_msgs = pre_recent
+
+        first_user = (
+            self.conversation[0]
+            if self.conversation and self.conversation[0].get("role") == "user"
+            else None
+        )
+
+        # ── L2: old messages → keyword digest + memory ───────────────────────
+        l2_msg = None
+        if old_msgs:
+            l2_msg = self._compress_l2(old_msgs)
+
+        # ── L1: middle messages → prose summary ──────────────────────────────
+        l1_msg = None
+        if middle_msgs:
+            l1_msg = self._compress_l1(middle_msgs)
+
+        # ── Rebuild ───────────────────────────────────────────────────────────
+        new_conv: list[dict] = []
+        if first_user:
+            new_conv.append(first_user)
+        if l2_msg:
+            new_conv.append(l2_msg)
+        if l1_msg:
+            new_conv.append(l1_msg)
+        new_conv.extend(recent_msgs)
+
+        removed = len(self.conversation) - len(new_conv)
+        self._emit(EVENT_STATUS, {
+            "message": (
+                f"  [Context] Hierarchical compression: "
+                f"{removed} msgs → L2({'keywords' if l2_msg else '-'}) "
+                f"+ L1({'summary' if l1_msg else '-'}) "
+                f"+ L0({len(recent_msgs)} verbatim)"
+            )
+        })
+        self.conversation[:] = new_conv
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _msgs_to_digest(msgs: list, max_chars_per_msg: int = 400) -> str:
+        """Convert messages to a plain-text digest, skipping thinking blocks."""
+        parts = []
+        for msg in msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text = " ".join(
+                    b.get("text", b.get("content", "")) if isinstance(b, dict) else str(b)
+                    for b in content
+                    if not (isinstance(b, dict) and b.get("type") == "thinking")
+                )
+            else:
+                text = str(content)
+            text = text.strip()
+            if text:
+                parts.append(f"[{role}] {text[:max_chars_per_msg]}")
+        return "\n".join(parts)
+
+    def _compress_l1(self, msgs: list) -> dict | None:
+        """L1: prose summary of middle zone."""
+        digest = self._msgs_to_digest(msgs)
+        if not digest:
+            return None
+        prompt = (
+            "Summarise the following conversation excerpt concisely. "
+            "Preserve: decisions made, files/tools used, errors encountered, "
+            "key facts learned. Omit pleasantries. "
+            "Reply with the summary only, in the same language as the excerpt.\n\n"
+            + digest
+        )
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a concise summariser. Reply only with the summary.",
+            )
+            text = resp.content[0].text if resp.content else "(unavailable)"
+        except Exception as exc:
+            self._emit(EVENT_STATUS, {"message": f"  [Context] L1 summary failed: {exc}"})
+            return None
+        return {
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"[Conversation summary – earlier turns]\n{text}"}],
+        }
+
+    def _compress_l2(self, msgs: list) -> dict | None:
+        """L2: keyword digest + extract key facts to memory.
+
+        Single LLM call returns JSON with:
+          - keywords: bullet-point string (max ~150 chars)
+          - facts: [{key, value, category}] to persist in MemoryStore
+        """
+        digest = self._msgs_to_digest(msgs, max_chars_per_msg=300)
+        if not digest:
+            return None
+
+        prompt = (
+            "Analyse this conversation excerpt. Respond ONLY with valid JSON, no markdown:\n"
+            '{\n'
+            '  "keywords": "• fact1 • fact2 • ...",\n'
+            '  "facts": [\n'
+            '    {"key": "short key", "value": "concise value", '
+            '"category": "preference|fact|task|error"}\n'
+            '  ]\n'
+            '}\n\n'
+            "keywords: bullet-point digest ≤ 200 chars.\n"
+            "facts: max 5 entries, only information worth remembering long-term.\n\n"
+            "Excerpt:\n" + digest
+        )
+        try:
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a concise analyst. Respond with valid JSON only.",
+            )
+            raw = resp.content[0].text.strip() if resp.content else "{}"
+            # Strip markdown fences if present
+            if raw.startswith("```"):
+                raw = "\n".join(raw.split("\n")[1:])
+                raw = raw.rsplit("```", 1)[0].strip()
+            data = json.loads(raw)
+        except Exception as exc:
+            self._emit(EVENT_STATUS, {"message": f"  [Context] L2 extraction failed: {exc}"})
+            return None
+
+        keywords = data.get("keywords", "")
+        facts    = data.get("facts", [])
+
+        # Persist facts to MemoryStore
+        saved = 0
+        if hasattr(self, "memory") and self.memory:
+            for f in facts:
+                key      = str(f.get("key", ""))[:80]
+                value    = str(f.get("value", ""))[:300]
+                category = str(f.get("category", "fact"))
+                if key and value:
+                    try:
+                        self.memory.save(key, value, category)
+                        saved += 1
+                    except Exception:
+                        pass
+
+        if saved:
+            self._emit(EVENT_STATUS, {
+                "message": f"  [Context] L2: saved {saved} facts to memory, compressed to keywords"
+            })
+
+        if not keywords.strip():
+            return None
+
+        return {
+            "role": "user",
+            "content": f"[Context from older turns – keywords]\n{keywords}",
+        }
+
+    def _hard_trim(self):
+        """Fallback: drop old messages without summarising (used by aggressive trim)."""
         first_user = None
         if self.conversation and self.conversation[0].get("role") == "user":
             first_user = self.conversation[0]
 
-        # Keep last N pairs (each pair = user + assistant)
         keep_from = max(1, len(self.conversation) - self._MAX_CONVERSATION_PAIRS * 2)
         trimmed = self.conversation[keep_from:]
-
         if first_user:
             trimmed = [first_user] + trimmed
 
         removed = len(self.conversation) - len(trimmed)
         if removed > 0:
             self._emit(EVENT_STATUS, {
-                "message": f"  [Context] Trimmed {removed} old messages to prevent context overflow"
+                "message": f"  [Context] Hard-trimmed {removed} old messages"
             })
             self.conversation[:] = trimmed
 
@@ -1238,6 +1534,8 @@ class Agent:
         if name in ("save_memory", "search_memory"):
             return handle_memory_tool(name, tool_input, self.memory)
         if name == "search_documents":
+            if self.rag is None:
+                return json.dumps({"error": "RAG not available in lightweight mode"})
             return handle_rag_tool(tool_input, self.rag)
         if name in ("read_file", "write_file", "list_files", "search_content"):
             return handle_file_tool(name, tool_input, workspace_root=self._workspace_dir)

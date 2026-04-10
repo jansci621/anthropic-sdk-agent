@@ -89,3 +89,9 @@
 
 ### New rules
 - Prefer direct textual answers when requests are simple and do not require external data or computation.
+
+---session---
+
+## Session Learnings — 2026-04-10
+
+*No tool calls were made during this session, so no behavioral patterns could be extracted.*
