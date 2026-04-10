@@ -51,6 +51,7 @@ class Agent:
         # Execution lock — prevents concurrent _agent_loop calls from scheduler + web sessions
         import threading as _threading
         self._execution_lock = _threading.Lock()
+        self._current_session_id: str = ""  # set by web_server before each request
 
         # Event bus for output abstraction
         from event_bus import EventBus, CLIPrintSink

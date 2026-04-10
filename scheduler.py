@@ -261,63 +261,52 @@ class TaskScheduler:
 
         agent, bus = self._agent_getter()
         # 获取 agent 执行锁，与用户会话串行，防止并发修改 agent.conversation
+        captured: list[dict] = []
+        ok = True
+        err_msg = ""
         with self._exec_lock, agent._execution_lock:
             capture = _CaptureSink()
-            bus.add_sink(capture)           # 临时挂载，仅捕获本次任务事件
+            bus.add_sink(capture)
             try:
                 append_scheduler_event("info", task.name, "started")
-
-                # 保存当前 conversation，执行完后无条件恢复
-                # 防止调度任务携带/污染共享 agent 的对话历史
                 saved_conv = list(agent.conversation)
                 try:
                     action = task.action
                     if action.type == "skill":
-                        # skill 也需要隔离：_trigger_skill 会 append 到 conversation
-                        # 清空后让它在空白上下文中独立执行
                         agent.conversation = []
                         agent._trigger_skill(action.skill, action.args)
                         task.last_result = f"OK — skill '{action.skill}' executed"
-
                     elif action.type == "query":
-                        # 独立单轮对话，不混入用户 session
                         agent.conversation = [{"role": "user", "content": action.query}]
                         agent._agent_loop()
                         task.last_result = "OK — query executed"
-
                     else:
                         task.last_result = f"Error: unknown action type '{action.type}'"
                 finally:
-                    agent.conversation = saved_conv  # 无论成功/失败都还原
+                    agent.conversation = saved_conv
 
                 captured = capture.get_events()
                 append_scheduler_event("ok", task.name, task.last_result, captured)
-                # 把结果写回原 session
-                if task.session_id and self._session_updater:
-                    try:
-                        self._session_updater(task.session_id, task.name, captured)
-                    except Exception as cb_err:
-                        log.warning("[Scheduler] session_updater failed: %s", cb_err)
-                print(
-                    f"\n{config.COLOR_SYSTEM}[Scheduler] ✓ Done: {task.name}{config.COLOR_RESET}\n"
-                )
+                print(f"\n{config.COLOR_SYSTEM}[Scheduler] ✓ Done: {task.name}{config.COLOR_RESET}\n")
 
             except Exception as e:
+                ok = False
+                err_msg = str(e)
                 task.last_result = f"Error: {e}"
                 log.exception("[Scheduler] Task '%s' failed", task.name)
                 captured = capture.get_events()
-                append_scheduler_event("error", task.name, str(e), captured)
-                if task.session_id and self._session_updater:
-                    try:
-                        self._session_updater(task.session_id, task.name, captured)
-                    except Exception:
-                        pass
-                print(
-                    f"\n{config.COLOR_SYSTEM}[Scheduler] ✗ Failed: {task.name} — {e}{config.COLOR_RESET}\n"
-                )
+                append_scheduler_event("error", task.name, err_msg, captured)
+                print(f"\n{config.COLOR_SYSTEM}[Scheduler] ✗ Failed: {task.name} — {e}{config.COLOR_RESET}\n")
             finally:
-                bus.remove_sink(capture)    # 执行完立即卸载，不影响后续 session
+                bus.remove_sink(capture)
                 self._save_tasks()
+
+        # ── session_updater 在锁外调用，避免死锁（内部有 I/O + _sessions 写入）──
+        if self._session_updater and captured:
+            try:
+                self._session_updater(task.session_id, task.name, captured)
+            except Exception as cb_err:
+                log.warning("[Scheduler] session_updater failed: %s", cb_err)
 
     def _refresh_next_run(self):
         for task in self._tasks.values():

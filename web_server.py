@@ -41,25 +41,25 @@ def _session_updater(session_id: str, task_name: str, events: list[dict]):
     dedicated_id = _ded_id(task_name)
 
     # Ensure the session exists in memory
-    if dedicated_id not in _sessions:
-        agent, bus = _get_shared_agent()
-        saved = _load_session(dedicated_id)
-        snapshot = saved["messages"] if saved and saved.get("messages") else []
-        _sessions[dedicated_id] = {"agent": agent, "bus": bus, "_conv_snapshot": list(snapshot)}
+    with _sessions_lock:
+        if dedicated_id not in _sessions:
+            agent, bus = _get_shared_agent()
+            saved = _load_session(dedicated_id)
+            snapshot = saved["messages"] if saved and saved.get("messages") else []
+            _sessions[dedicated_id] = {"agent": agent, "bus": bus, "_conv_snapshot": list(snapshot)}
 
-    session = _sessions[dedicated_id]
-    synthetic = {
-        "role": "assistant",
-        "content": [{"type": "text", "text": text.strip()}],
-    }
-    snapshot = list(session.get("_conv_snapshot", []))
+        session = _sessions[dedicated_id]
+        synthetic = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text.strip()}],
+        }
+        snapshot = list(session.get("_conv_snapshot", []))
+        if not snapshot:
+            snapshot.append({"role": "user", "content": f"⏰ {task_name}"})
+        snapshot.append(synthetic)
+        session["_conv_snapshot"] = snapshot
 
-    # Add a user-role "header" message if this is the first result
-    if not snapshot:
-        snapshot.append({"role": "user", "content": f"⏰ {task_name}"})
-
-    snapshot.append(synthetic)
-    session["_conv_snapshot"] = snapshot
+    # Save outside the lock — I/O should not hold _sessions_lock
     _save_session(dedicated_id, snapshot)
 
 
@@ -83,6 +83,7 @@ app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "web", "static
 # ── Session Persistence ───────────────────────────────────────────────────────
 
 _sessions: dict[str, dict] = {}  # session_id -> {"agent": Agent, "bus": EventBus}
+_sessions_lock = threading.Lock()  # guards _sessions from scheduler background thread
 
 # Shared agent — one instance for all sessions (avoids reloading RAG model)
 _shared_agent: Agent | None = None
