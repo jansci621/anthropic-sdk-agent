@@ -58,14 +58,239 @@ def _read_text(filepath: str) -> str:
         return f.read()
 
 
-def _read_pdf(filepath: str) -> str:
-    try:
-        import pypdf
-        reader = pypdf.PdfReader(filepath)
-        return "\n\n".join(page.extract_text() or "" for page in reader.pages)
-    except ImportError:
-        print("[RAG] Warning: pypdf not installed. Install with: pip install pypdf")
+def _is_valid_table(table: list) -> bool:
+    """Three-gate quality check for an extracted table."""
+    if not table or len(table) < 2:
+        return False
+    col_counts = [len(row) for row in table]
+    if len(set(col_counts)) > 1:          # inconsistent column count
+        return False
+    total = sum(col_counts)
+    empty = sum(1 for row in table for cell in row if not (cell or "").strip())
+    if total and empty / total > 0.3:     # >30% empty cells
+        return False
+    has_nums = any(
+        any(c.isdigit() for c in (cell or ""))
+        for row in table for cell in row
+    )
+    return has_nums
+
+
+_OCR_NUM_MAP = str.maketrans({
+    "O": "0", "o": "0",         # O/o → 0
+    "l": "1", "I": "1",         # l/I → 1
+    "S": "5",                   # S   → 5
+    "B": "8",                   # B   → 8
+    "Z": "2",                   # Z   → 2
+    "q": "9",                   # q   → 9
+})
+
+_NUMERIC_CTX_RE = re.compile(
+    r'^[\d\s,，.。¥￥$€£元万亿%±\-+/（）()\[\]OolISBZq]+$'
+)
+
+
+def _fix_ocr_numbers(cell: str) -> str:
+    """Fix systematic OCR character confusions in numeric/amount table cells.
+
+    Only applies when the cell is predominantly numeric context to avoid
+    incorrectly replacing letters in text cells (e.g. "SaaS" → "5aa5" is wrong).
+    """
+    if not cell:
+        return cell
+    stripped = cell.strip()
+    if not stripped:
+        return cell
+    if _NUMERIC_CTX_RE.match(stripped):
+        return stripped.translate(_OCR_NUM_MAP)
+    return cell
+
+
+def _table_to_markdown(table: list) -> str:
+    """Convert a pdfplumber table to GitHub-flavored Markdown.
+
+    Applies OCR number correction to each cell before formatting.
+    """
+    if not table:
         return ""
+
+    def fmt(cell) -> str:
+        return _fix_ocr_numbers(str(cell or "").strip())
+
+    header = "| " + " | ".join(fmt(c) for c in table[0]) + " |"
+    sep    = "|" + "|".join(["---"] * len(table[0])) + "|"
+    rows   = [
+        "| " + " | ".join(fmt(c) for c in row) + " |"
+        for row in table[1:]
+    ]
+    return "\n".join([header, sep] + rows)
+
+
+def _is_scanned_page(page_text: str, page_width: float = 0) -> bool:
+    """Detect scanned pages by text density (very few characters → likely scanned)."""
+    chars = len((page_text or "").strip())
+    return chars < 20  # heuristic: real pages have at least a few dozen chars
+
+
+def _extract_tables_camelot(filepath: str, page_num: int) -> list[str]:
+    """P3: Camelot visual fallback for tables that pdfplumber fails on.
+
+    Camelot uses two algorithms:
+      - lattice: detects tables via visible grid lines (handles bordered tables)
+      - stream:  detects tables via whitespace gaps (handles borderless tables)
+
+    No GPU needed. Requires: pip install camelot-py[cv]
+
+    Returns list of Markdown strings, one per detected table.
+    Falls back gracefully if camelot is not installed.
+    """
+    try:
+        import camelot
+    except ImportError:
+        return []
+
+    results = []
+    page_str = str(page_num + 1)  # camelot uses 1-based page numbers
+
+    for flavor in ("lattice", "stream"):
+        try:
+            tables = camelot.read_pdf(filepath, pages=page_str, flavor=flavor)
+            for tbl in tables:
+                df = tbl.df
+                if df.empty or len(df) < 2:
+                    continue
+                # Convert DataFrame to list-of-lists for _is_valid_table check
+                tbl_list = [df.columns.tolist()] + df.values.tolist()
+                if not _is_valid_table(tbl_list):
+                    continue
+                # DataFrame to Markdown
+                header = "| " + " | ".join(_fix_ocr_numbers(str(c)) for c in df.columns) + " |"
+                sep    = "|" + "|".join(["---"] * len(df.columns)) + "|"
+                rows   = [
+                    "| " + " | ".join(_fix_ocr_numbers(str(v)) for v in row) + " |"
+                    for _, row in df.iterrows()
+                ]
+                results.append("\n".join([header, sep] + rows))
+            if results:
+                break  # lattice succeeded, no need to try stream
+        except Exception:
+            continue
+
+    return results
+
+
+def _read_pdf(filepath: str) -> str:
+    """Structured PDF reader: pdfplumber for tables → Markdown, plain text for prose.
+
+    Strategy:
+      1. Try pdfplumber (preserves table structure)
+      2. For each page, extract tables → Markdown; remaining text as-is
+      3. Detect scanned pages and mark them for future OCR routing
+      4. Cross-page table merging: if current page ends with partial table
+         and next page starts with matching column count, merge them
+      5. Fall back to pypdf plain-text extraction if pdfplumber unavailable
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        # Fallback to pypdf (structure-blind but better than nothing)
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(filepath)
+            text = "\n\n".join(page.extract_text() or "" for page in reader.pages)
+            if not text.strip():
+                print(f"[RAG] Warning: {filepath} appears to be scanned (no text extracted)")
+            return text
+        except ImportError:
+            print("[RAG] Warning: neither pdfplumber nor pypdf installed.")
+            return ""
+
+    pages_text: list[str] = []
+    pending_table_header: list | None = None   # for cross-page table merging
+    pending_table_rows:   list       = []
+
+    def flush_pending_table() -> str:
+        nonlocal pending_table_header, pending_table_rows
+        if pending_table_header is None:
+            return ""
+        tbl = [pending_table_header] + pending_table_rows
+        pending_table_header = None
+        pending_table_rows   = []
+        return _table_to_markdown(tbl) if _is_valid_table(tbl) else ""
+
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                raw_text   = page.extract_text() or ""
+                is_scanned = _is_scanned_page(raw_text)
+
+                if is_scanned:
+                    # Mark scanned pages; full OCR pipeline is a future P2 item
+                    pages_text.append(f"[Page {page_num + 1}: scanned image, text unavailable]")
+                    pages_text.append(flush_pending_table())
+                    continue
+
+                page_parts: list[str] = []
+
+                # ── Extract tables with structure ─────────────────────
+                tables = page.extract_tables() or []
+                for tbl in tables:
+                    if not tbl:
+                        continue
+
+                    # Cross-page merge: if we have a pending table whose
+                    # column count matches this table's first data row, merge
+                    if (pending_table_header is not None
+                            and len(tbl[0]) == len(pending_table_header)):
+                        # First row of new page is likely data (not a new header)
+                        pending_table_rows.extend(tbl)
+                        continue
+
+                    # Flush any pending cross-page table first
+                    flushed = flush_pending_table()
+                    if flushed:
+                        page_parts.append(flushed)
+
+                    if _is_valid_table(tbl):
+                        md = _table_to_markdown(tbl)
+                        page_parts.append(md)
+                        # Track last table for potential cross-page continuation
+                        pending_table_header = tbl[0]
+                        pending_table_rows   = list(tbl[1:])
+                    else:
+                        # P3: pdfplumber quality check failed → try camelot fallback
+                        camelot_tables = _extract_tables_camelot(filepath, page_num)
+                        if camelot_tables:
+                            page_parts.extend(camelot_tables)
+                        else:
+                            # Both failed — treat rows as plain text
+                            page_parts.append(
+                                "\n".join(
+                                    " ".join(str(c or "") for c in row) for row in tbl
+                                )
+                            )
+
+                # ── Remaining prose text (non-table regions) ──────────
+                if raw_text.strip():
+                    page_parts.append(raw_text)
+
+                pages_text.append("\n\n".join(p for p in page_parts if p.strip()))
+
+            # Flush any table that started on the last page
+            flushed = flush_pending_table()
+            if flushed:
+                pages_text.append(flushed)
+
+    except Exception as exc:
+        print(f"[RAG] pdfplumber failed for {filepath}: {exc}, falling back to pypdf")
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(filepath)
+            return "\n\n".join(page.extract_text() or "" for page in reader.pages)
+        except Exception:
+            return ""
+
+    return "\n\n".join(p for p in pages_text if p.strip())
 
 
 def _read_json(filepath: str) -> str:
@@ -141,9 +366,17 @@ def _is_table_row(line: str) -> bool:
 # ── RAG System ──────────────────────────────────────────────────────────────
 
 class RAGSystem:
-    """Document retrieval using local sentence embeddings and FAISS + BM25."""
+    """Document retrieval using local sentence embeddings and FAISS + BM25.
+
+    Advanced retrieval features:
+      - Multi-granularity indexing (child chunks for retrieval, parent for context)
+      - Cross-encoder reranking (optional, activated when sentence-transformers cross-encoder is available)
+      - HyDE support (caller passes hypothetical document via extra_queries)
+    """
 
     _CACHE_SUBDIR = ".rag_cache"
+    # Parent chunk is _PARENT_RATIO times larger than child chunk
+    _PARENT_RATIO = 3
 
     def __init__(
         self,
@@ -152,22 +385,32 @@ class RAGSystem:
         chunk_size: int = config.CHUNK_SIZE,
         chunk_overlap: int = config.CHUNK_OVERLAP,
         top_k: int = config.TOP_K_RESULTS,
+        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
     ):
         self.knowledge_base_dir = knowledge_base_dir
-        self.chunk_size = chunk_size        # in tokens
-        self.chunk_overlap = chunk_overlap  # in tokens
+        self.chunk_size = chunk_size        # child chunk size in tokens
+        self.chunk_overlap = chunk_overlap
         self.top_k = top_k
         self._cache_dir = os.path.join(knowledge_base_dir, self._CACHE_SUBDIR)
 
+        # child chunks: used for bi-encoder retrieval (fine-grained)
         self.chunks: list[dict] = []
         self.embeddings: np.ndarray | None = None
-        self.index = None   # FAISS or None
-        self._bm25 = None   # rank_bm25.BM25Okapi or None
+        self.index = None
+        self._bm25 = None
+
+        # parent chunks: returned to caller for full context
+        # key = (source_file, parent_idx), value = text
+        self._parent_chunks: dict[tuple, str] = {}
+
+        # cross-encoder reranker (optional)
+        self._cross_encoder = self._load_cross_encoder(cross_encoder_model)
 
         print(f"[RAG] Loading documents from {knowledge_base_dir} ...")
         self.model = self._load_embedding_model(embedding_model)
         self._load_and_index()
-        print(f"[RAG] Indexed {len(self.chunks)} chunks from knowledge base.")
+        rerank_status = "cross-encoder" if self._cross_encoder else "no reranker"
+        print(f"[RAG] Indexed {len(self.chunks)} child chunks | {rerank_status}.")
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -233,12 +476,40 @@ class RAGSystem:
             for i in all_ids
         }
 
-        top_ids = sorted(fused, key=lambda i: fused[i], reverse=True)[:k]
+        # ── Cross-encoder reranking ────────────────────────────────────
+        # Expand candidate pool for reranking, then cut to k after
+        rerank_k = min(k * 3, len(fused))
+        candidate_ids = sorted(fused, key=lambda i: fused[i], reverse=True)[:rerank_k]
+
+        if self._cross_encoder and len(candidate_ids) > 1:
+            pairs = [(query, self.chunks[i]["text"]) for i in candidate_ids]
+            try:
+                ce_scores = self._cross_encoder.predict(pairs)
+                # Re-sort by cross-encoder score
+                ranked = sorted(zip(candidate_ids, ce_scores),
+                                key=lambda x: x[1], reverse=True)
+                top_ids = [i for i, _ in ranked[:k]]
+            except Exception:
+                top_ids = candidate_ids[:k]
+        else:
+            top_ids = candidate_ids[:k]
+
+        # ── Expand child → parent chunk for richer context ────────────
         results = []
         for i in top_ids:
-            chunk = self.chunks[i].copy()
-            chunk["score"] = round(fused[i], 4)
-            results.append(chunk)
+            child = self.chunks[i]
+            parent_key = child.get("parent_key")
+            if parent_key and parent_key in self._parent_chunks:
+                text = self._parent_chunks[parent_key]
+            else:
+                text = child["text"]
+            results.append({
+                "text": text,
+                "source": child["source"],
+                "chunk_index": child["chunk_index"],
+                "header_path": child.get("header_path", ""),
+                "score": round(fused.get(i, 0.0), 4),
+            })
         return results
 
     # ── Internal ─────────────────────────────────────────────────────────
@@ -249,6 +520,16 @@ class RAGSystem:
             return SentenceTransformer(model_name)
         except ImportError:
             print("[RAG] Warning: sentence-transformers not installed.")
+            return None
+
+    def _load_cross_encoder(self, model_name: str):
+        """Load cross-encoder reranker. Returns None if not available (graceful degradation)."""
+        try:
+            from sentence_transformers import CrossEncoder
+            ce = CrossEncoder(model_name)
+            return ce
+        except Exception:
+            # Not installed or model unavailable — retrieval still works without reranking
             return None
 
     def _load_and_index(self):
@@ -289,13 +570,35 @@ class RAGSystem:
             print(f"[RAG] Loaded from cache ({content_hash[:8]}).")
             return
 
-        # Build fresh
-        all_chunks: list[dict] = []
+        # Build fresh — multi-granularity indexing
+        all_child_chunks: list[dict] = []
         for filename, text in file_contents.items():
-            all_chunks.extend(self._chunk_text(text, source_file=filename))
+            # Child chunks (small, for precise retrieval)
+            child_chunks = self._chunk_text(text, source_file=filename)
 
-        self.chunks = all_chunks
-        texts = [c["text"] for c in all_chunks]
+            # Parent chunks (larger context, returned when child is retrieved)
+            parent_size = self.chunk_size * self._PARENT_RATIO
+            parent_chunks = self._chunk_text_with_size(
+                text, source_file=filename, chunk_size=parent_size
+            )
+            # Build lookup: map each child to nearest parent
+            for child in child_chunks:
+                parent_key = self._find_parent_key(child, parent_chunks)
+                child["parent_key"] = parent_key
+                if parent_key and parent_key not in self._parent_chunks:
+                    pid, pidx = parent_key
+                    parent = next(
+                        (p for p in parent_chunks
+                         if p["source"] == pid and p["chunk_index"] == pidx),
+                        None,
+                    )
+                    if parent:
+                        self._parent_chunks[parent_key] = parent["text"]
+
+            all_child_chunks.extend(child_chunks)
+
+        self.chunks = all_child_chunks
+        texts = [c["text"] for c in all_child_chunks]
         self.embeddings = np.array(
             self.model.encode(texts, normalize_embeddings=True, show_progress_bar=True),
             dtype=np.float32,
@@ -303,6 +606,28 @@ class RAGSystem:
         self._build_index()
         self._build_bm25()
         self._save_cache(content_hash)
+
+    def _chunk_text_with_size(self, text: str, source_file: str,
+                               chunk_size: int) -> list[dict]:
+        """Chunk with a custom size (used for parent chunks)."""
+        original = self.chunk_size
+        self.chunk_size = chunk_size
+        result = self._chunk_text(text, source_file)
+        self.chunk_size = original
+        return result
+
+    @staticmethod
+    def _find_parent_key(child: dict, parents: list[dict]) -> tuple | None:
+        """Find the parent chunk whose text contains the child's text."""
+        c_text = child.get("text", "")
+        # Use a short fingerprint from the middle of the child text to locate parent
+        fp = c_text[len(c_text) // 4: len(c_text) // 4 + 40].strip()
+        if not fp:
+            return None
+        for p in parents:
+            if fp in p.get("text", ""):
+                return (p["source"], p["chunk_index"])
+        return None
 
     def _build_index(self):
         try:
@@ -433,15 +758,36 @@ class RAGSystem:
             return 3
         return 4
 
-    def _chunk_text(self, text: str, source_file: str) -> list[dict]:
-        """V3 semantic chunking: structure-aware, table-header-preserving, intro-copying.
+    # ── Chunking configuration ────────────────────────────────────────────────
+    # Levels that ALWAYS force a flush regardless of current chunk size.
+    # Level 1 = 第X章 / #
+    # Level 2 = 第X节 / ##  / 1.
+    # Level 3+ = 第X条 / ### / 1.1 / （一）  ← only flush when chunk is big enough
+    _FORCE_FLUSH_LEVELS: frozenset = frozenset({1, 2})
+    _MIN_CHUNK_RATIO = 0.25  # minor headers flush only when chunk >= 25% of max_chars
 
-        Enhancement: each chunk carries the full ancestor header path
-        (e.g. "第一章 总则 > 第一节 适用范围 > 1.1 定义") so retrieval
-        can match queries that reference parent sections.
+    def _chunk_text(self, text: str, source_file: str) -> list[dict]:
+        """V3 semantic chunking with level-aware flushing and parent-section context.
+
+        Key improvements over naive header splitting:
+
+        1. Level-based flushing:
+           H1/H2 (章/节) always start a new chunk — they are true semantic boundaries.
+           H3+ (条/小节) only flush when the current chunk is ≥ 25% of max_chars.
+           This prevents tiny isolated chunks for short subsections.
+
+        2. Parent-section intro carrying:
+           When a low-level header eventually does flush, the opening paragraph of
+           the nearest H1/H2 ancestor ('section_intro') is prepended to the new chunk.
+           This gives downstream LLMs the broader context ("保险责任" vs "责任免除").
+
+        3. Full header path prefix:
+           Every chunk carries [Ch1 > Sec1 > 1.1] so queries about parent sections
+           still match child chunks.
         """
         cpt = self._chars_per_token(text)
         max_chars = int(self.chunk_size * cpt)
+        min_chars = int(max_chars * self._MIN_CHUNK_RATIO)
         overlap_chars = int(self.chunk_overlap * cpt)
 
         blocks = self._parse_blocks(text)
@@ -449,18 +795,19 @@ class RAGSystem:
         idx = 0
         current = ""
         last_header = ""
-        # Stack: list of (level, header_text)
         header_stack: list[tuple[int, str]] = []
+        # First substantial paragraph after the nearest major (level≤2) header.
+        # Carried into sub-chunks so they retain parent-section context.
+        section_intro: str = ""
+        intro_captured = False   # whether we've captured the intro for current major section
 
         def _header_path() -> str:
-            """Full ancestor path: 'Ch1 > Sec1 > 1.1'"""
             return " > ".join(h for _, h in header_stack) if header_stack else ""
 
         def flush(extra: str = "") -> str:
             nonlocal idx
             body = (current + ("\n" + extra if extra else "")).strip()
             if body:
-                # Prepend full header path as context prefix
                 path = _header_path()
                 text_with_path = f"[{path}]\n{body}" if path else body
                 chunks.append({
@@ -475,17 +822,41 @@ class RAGSystem:
         for block in blocks:
             btype = block["type"]
 
-            # ── Header: always start a fresh chunk ───────────────────
+            # ── Header ───────────────────────────────────────────────
             if btype == "header":
-                flush()
-                htext = block["text"]
+                htext  = block["text"]
                 hlevel = self._header_level(htext)
-                # Maintain a stack: pop same/deeper levels
+
+                # Level-based flushing decision
+                is_major  = hlevel in self._FORCE_FLUSH_LEVELS
+                big_enough = len(current) >= min_chars
+
+                if is_major or big_enough:
+                    flush()
+                    if is_major:
+                        # Entering a new major section: reset intro context
+                        section_intro   = ""
+                        intro_captured  = False
+                    else:
+                        # Minor header flush: next chunk starts with section_intro
+                        # so the reader has parent context
+                        ctx = section_intro + "\n" if section_intro else ""
+                        current = ctx
+                    # After flush, start fresh accumulation with this header
+                    current = current + htext + "\n"
+                else:
+                    # Minor header, chunk too small: DON'T flush.
+                    # Append header as an in-chunk separator — keeps subsections
+                    # together when they're collectively short.
+                    if current.strip():
+                        current = current.rstrip() + "\n\n"
+                    current += htext + "\n"
+
+                # Always update the stack
                 while header_stack and header_stack[-1][0] >= hlevel:
                     header_stack.pop()
                 header_stack.append((hlevel, htext))
                 last_header = htext
-                current = htext + "\n"
                 continue
 
             # ── Table: split rows while preserving header ─────────────
@@ -539,14 +910,27 @@ class RAGSystem:
             # ── Text / list_item ──────────────────────────────────────
             block_text = block["text"]
 
+            # Capture the first substantial paragraph after a major header
+            # as section_intro for sub-chunk context carrying.
+            if (not intro_captured
+                    and block_text.strip()
+                    and header_stack
+                    and header_stack[0][0] in self._FORCE_FLUSH_LEVELS):
+                section_intro  = block_text[:300]  # first 300 chars is enough for context
+                intro_captured = True
+
             if len(current) + len(block_text) + 1 <= max_chars:
                 current = (current + "\n" + block_text).strip() + "\n"
             else:
-                # Flush and start a new chunk with overlap
+                # Flush and start new chunk with section_intro + overlap for context
                 flushed = flush()
-                overlap = self._align_overlap(flushed, overlap_chars)
+                overlap    = self._align_overlap(flushed, overlap_chars)
                 header_ctx = (last_header + "\n").strip() if last_header else ""
-                current = (header_ctx + "\n" + overlap + "\n" + block_text).strip() + "\n"
+                # Prepend section_intro when available so sub-chunks retain
+                # the broader "what this section is about" context
+                intro_ctx  = (f"[Context: {section_intro}]\n"
+                              if section_intro and section_intro not in flushed else "")
+                current = (intro_ctx + header_ctx + "\n" + overlap + "\n" + block_text).strip() + "\n"
 
                 # If a single block still exceeds max_chars, split by sentences
                 if len(current) > max_chars:
@@ -620,3 +1004,89 @@ def handle_rag_tool(tool_input: dict, rag: RAGSystem) -> str:
     extra        = tool_input.get("extra_queries")  # list[str] | None
     results      = rag.search(query, top_k, extra_queries=extra)
     return json.dumps({"query": query, "results": results}, ensure_ascii=False)
+
+
+# ── P2-B: LLM-based retrieval quality evaluation ─────────────────────────────
+
+def evaluate_rag_retrieval(
+    rag: RAGSystem,
+    test_cases: list[dict],
+    llm_client=None,
+    llm_model: str = "claude-haiku-4-5-20251001",
+) -> dict:
+    """Evaluate RAG retrieval quality using LLM as judge.
+
+    Args:
+        rag:        RAGSystem instance to evaluate
+        test_cases: list of {"query": str, "expected_keywords": list[str]}
+                    OR {"query": str, "ground_truth": str}
+        llm_client: optional anthropic.Anthropic client for LLM scoring
+                    (falls back to keyword matching if None)
+        llm_model:  cheap model for scoring (Haiku recommended)
+
+    Returns:
+        {"total": N, "hits": M, "hit_rate": 0.xx, "badcases": [...]}
+
+    Usage:
+        from rag import RAGSystem, evaluate_rag_retrieval
+        import anthropic
+
+        rag = RAGSystem()
+        cases = [
+            {"query": "45岁重疾险保费", "expected_keywords": ["45", "保费", "重疾"]},
+            {"query": "等待期规定",      "ground_truth": "本合同等待期为180天"},
+        ]
+        report = evaluate_rag_retrieval(rag, cases)
+        print(f"Hit rate: {report['hit_rate']:.1%}")
+    """
+    hits = 0
+    badcases = []
+
+    for case in test_cases:
+        query   = case.get("query", "")
+        results = rag.search(query, top_k=3)
+        retrieved_text = "\n---\n".join(r.get("text", "") for r in results)
+
+        hit = False
+
+        if "ground_truth" in case and llm_client:
+            # LLM judge: does the retrieved text contain the answer?
+            prompt = (
+                f"Query: {query}\n\n"
+                f"Expected answer hint: {case['ground_truth']}\n\n"
+                f"Retrieved chunks:\n{retrieved_text[:2000]}\n\n"
+                "Does the retrieved text contain enough information to answer the query? "
+                "Reply with only YES or NO."
+            )
+            try:
+                resp = llm_client.messages.create(
+                    model=llm_model,
+                    max_tokens=5,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                hit = "yes" in (resp.content[0].text or "").lower()
+            except Exception:
+                hit = False
+
+        elif "expected_keywords" in case:
+            # Keyword matching fallback (no LLM needed)
+            kws = [k.lower() for k in case["expected_keywords"]]
+            text_lower = retrieved_text.lower()
+            hit = all(kw in text_lower for kw in kws)
+
+        if hit:
+            hits += 1
+        else:
+            badcases.append({
+                "query":     query,
+                "retrieved": retrieved_text[:300],
+                "expected":  case.get("ground_truth") or case.get("expected_keywords"),
+            })
+
+    total = len(test_cases)
+    return {
+        "total":    total,
+        "hits":     hits,
+        "hit_rate": hits / total if total else 0.0,
+        "badcases": badcases,
+    }

@@ -1511,29 +1511,42 @@ class Agent:
         })
 
     def _expand_rag_query(self, query: str) -> list[str]:
-        """Generate 2 alternative query phrasings to improve RAG recall.
+        """Generate query variants for multi-query retrieval.
 
-        Uses a single cheap LLM call. Returns [] on failure so retrieval
-        continues with the original query unchanged.
+        Combines two strategies in one LLM call:
+          1. Query Expansion  — 2 alternative phrasings of the original query
+          2. HyDE             — 1 short hypothetical passage that would answer the query
+
+        All variants are passed to RAGSystem.search() as extra_queries.
+        The dense retrieval uses the HyDE embedding (document-style text is
+        closer to the document embedding space than a question).
+
+        Returns [] on failure — retrieval continues with original query only.
         """
         if not query or len(query) < 5:
             return []
         try:
             resp = self.client.messages.create(
                 model=self.model,
-                max_tokens=120,
-                system="You are a search query rewriter. Output ONLY the alternative queries, one per line, no numbering.",
+                max_tokens=200,
+                system=(
+                    "You are a search assistant. Output ONLY the requested lines, "
+                    "no labels, no numbering, no extra text."
+                ),
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"Rewrite the following search query in 2 different ways "
-                        f"to improve document retrieval. Use synonyms and different "
-                        f"phrasings. Same language as the original.\n\nQuery: {query}"
+                        f"Given the search query below, output 3 lines:\n"
+                        f"Line 1: Alternative phrasing 1 (same language)\n"
+                        f"Line 2: Alternative phrasing 2 (same language)\n"
+                        f"Line 3: A short hypothetical passage (1-2 sentences) "
+                        f"that would directly answer this query, written as a document excerpt.\n\n"
+                        f"Query: {query}"
                     ),
                 }],
             )
             lines = [l.strip() for l in resp.content[0].text.strip().splitlines() if l.strip()]
-            return lines[:2]
+            return lines[:3]
         except Exception:
             return []
 
