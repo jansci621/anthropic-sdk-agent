@@ -1,5 +1,7 @@
 # AI Agent with Memory & RAG
 
+[English](./README_EN.md) | 中文
+
 基于 Anthropic SDK 构建的智能 Agent，支持持久化记忆、RAG 文档检索、工具调用、自我修复、自我进化，以及 **ReAct 推理模式**与**自动路由**。
 
 ## 特性
@@ -7,7 +9,7 @@
 - **流式对话** — 实时输出思维过程和回复，支持 adaptive thinking
 - **Web UI** — DeepSeek 风格的 Web 聊天界面，实时展示 Thinking、工具调用和结果（`--web`）
 - **持久化记忆** — 跨会话存储和检索用户偏好、项目信息等
-- **RAG 文档检索** — 本地知识库的语义搜索（基于 FAISS + sentence-transformers）
+- **RAG 文档检索** — 本地知识库语义搜索（FAISS 向量 + BM25 稀疏混合检索，支持 .txt/.md/.pdf/.json/.csv，embedding 结果本地缓存）
 - **内置工具** — 文件读写、内容搜索、URL 抓取、Web 搜索、Shell 命令执行
 - **技能系统** — 可热加载/卸载的插件式技能（`+skill` / `-skill`）
 - **多 Provider 支持** — Anthropic / OpenRouter / Together / DeepSeek / Anyscale / 自定义端点
@@ -223,7 +225,7 @@ Agent 在运行过程中持续学习和优化：
 | `AI_BASE_URL` | 自动 | 自定义 API 端点 |
 | `AI_MODEL` | 自动 | 模型名称（默认按 provider 自动选择） |
 | `AI_THINKING` | `true` | 是否启用 extended thinking |
-| `AI_MAX_TOKENS` | `16000` | 最大输出 token 数 |
+| `AI_MAX_TOKENS` | `64000` | 最大输出 token 数（过大会显著增加费用，128K ≈ $2-4/call） |
 | `AI_SKILLS_DIR` | `./skills` | 技能目录路径 |
 | `AI_AUTO_ROUTE` | `true` | 自动路由（ReAct vs 通用模式） |
 | `AI_ROUTER_MODEL` | 自动 | 路由 LLM 分类器使用的模型（默认为各 provider 最快/最便宜的型号） |
@@ -241,7 +243,7 @@ anthropic-sdk-agent/
 ├── react.py                # ReAct 循环：Thought → Action → Observation
 ├── router.py               # 自动路由：快规则 + LLM 分类器
 ├── memory.py               # 持久化记忆系统
-├── rag.py                  # RAG 文档检索（FAISS）
+├── rag.py                  # RAG 文档检索（FAISS + BM25 混合，V3 语义分块，embedding 缓存）
 ├── file_tools.py           # 文件操作工具
 ├── web_tools.py            # Web 工具（URL 抓取、搜索）
 ├── shell_tools.py          # Shell 命令工具
@@ -257,7 +259,7 @@ anthropic-sdk-agent/
 ├── skills/                 # 可扩展技能目录
 │   ├── base.py             # 技能基类
 │   └── weather/            # 示例：天气技能
-├── knowledge_base/         # RAG 知识库（放入 .md/.txt 文件即可索引）
+├── knowledge_base/         # RAG 知识库（支持 .md/.txt/.pdf/.json/.csv，索引缓存在 .rag_cache/）
 ├── data/                   # 运行时持久化数据
 │   ├── memories.json       # 记忆存储
 │   ├── experiences.json    # 经验存储
@@ -317,7 +319,7 @@ python main.py --web
 
 ## Docker 部署
 
-基于 CentOS 7，使用阿里云镜像源构建。
+基于 CentOS 8，使用阿里云 vault 镜像源构建，以非 root 用户（`agent` UID 1001）运行。
 
 ### 构建镜像
 
@@ -379,7 +381,7 @@ docker run -it --rm \
 | `AI_API_KEY` | 是 | API Key（也可用 Provider 专属变量如 `ANTHROPIC_API_KEY`） |
 | `AI_MODEL` | custom 时必填 | 模型名称 |
 | `AI_THINKING` | 否 | 是否启用 thinking，默认 `true` |
-| `AI_MAX_TOKENS` | 否 | 最大输出 token，默认 `128000` |
+| `AI_MAX_TOKENS` | 否 | 最大输出 token，默认 `64000` |
 | `HF_ENDPOINT` | 否 | HuggingFace 镜像，国内可设为 `https://hf-mirror.com` |
 
 ### 挂载目录
