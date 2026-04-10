@@ -184,7 +184,8 @@ class Agent:
                 if not query:
                     print(f"{config.COLOR_SYSTEM}Usage: /react <your question or task>{config.COLOR_RESET}\n")
                 else:
-                    self._run_react(query)
+                    with self._execution_lock:
+                        self._run_react(query)
                 continue
 
             # ── Skill commands ──────────────────────────────────────────────
@@ -197,7 +198,8 @@ class Agent:
             skill_match = self._match_skill_command(user_input)
             if skill_match:
                 skill_name, args = skill_match
-                self._trigger_skill(skill_name, args)
+                with self._execution_lock:
+                    self._trigger_skill(skill_name, args)
                 continue
 
             # +skill <name> — hot load
@@ -214,7 +216,8 @@ class Agent:
             skill_match = self._match_skill_natural(user_input)
             if skill_match:
                 skill_name, args = skill_match
-                self._trigger_skill(skill_name, args)
+                with self._execution_lock:
+                    self._trigger_skill(skill_name, args)
                 continue
 
             if config.AUTO_ROUTE:
@@ -224,11 +227,13 @@ class Agent:
                         f"{config.COLOR_SYSTEM}[Router → ReAct] "
                         f"{decision.reason} (conf={decision.confidence:.0%}){config.COLOR_RESET}"
                     )
-                    self._run_react(user_input)
+                    with self._execution_lock:
+                        self._run_react(user_input)
                     continue
 
             self.conversation.append({"role": "user", "content": user_input})
-            self._agent_loop()
+            with self._execution_lock:
+                self._agent_loop()
 
     # ── Skill Commands ────────────────────────────────────────────────────
 

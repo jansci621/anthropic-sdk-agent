@@ -8,6 +8,7 @@ import socket
 import urllib.parse
 import urllib.request
 import urllib.error
+import http.client
 
 
 def run(params: dict) -> str:
@@ -62,8 +63,12 @@ def run(params: dict) -> str:
             {"status": "error", "city": city, "error": f"HTTP {e.code}: {e.reason}"},
             ensure_ascii=False,
         )
+    except (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError) as e:
+        return json.dumps(
+            {"status": "error", "city": city, "error": f"Network Error: The remote server closed the connection unexpectedly. Please try again later."},
+            ensure_ascii=False,
+        )
     except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
-        reason = getattr(e, 'reason', str(e))
         return json.dumps(
             {"status": "error", "city": city, "error": f"Network Error: Failed to connect to the weather service due to a timeout. Please check your network connection and try again later."},
             ensure_ascii=False,

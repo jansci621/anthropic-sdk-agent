@@ -85,9 +85,13 @@ FILE_TOOLS = [
     {
         "name": "list_files",
         "description": (
-            "Find files matching a glob pattern. "
+            "Find files matching a glob pattern within a directory. "
             "e.g. '**/*.py' finds all Python files recursively. "
-            "Returns matching file paths sorted by modification time."
+            "Returns matching file paths sorted by modification time. "
+            "NOTE: only use for small/medium directories (project folders). "
+            "For searching across large directories like home (~) or system paths, "
+            "use run_command with `find <path> -maxdepth 4 -name '<pattern>'` instead "
+            "— it is much faster and won't time out."
         ),
         "input_schema": {
             "type": "object",
@@ -188,18 +192,35 @@ def _write_file(path: str, content: str, workspace_root: str | None = None) -> s
 
 
 def _list_files(pattern: str, path: str = ".", workspace_root: str | None = None) -> str:
-    """Glob files and return sorted by mtime."""
+    """Glob files and return sorted by mtime (with 8-second timeout)."""
+    import concurrent.futures as _cf
+
     root = os.path.realpath(workspace_root or _DEFAULT_WORKSPACE)
-    # Resolve relative paths against workspace root
     if workspace_root and not os.path.isabs(path):
         abs_base = os.path.join(root, path)
     else:
         abs_base = os.path.abspath(path)
-    matches = _glob.glob(os.path.join(abs_base, pattern), recursive=True)
-    # Sort by modification time
-    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    # Return relative paths
-    results = [os.path.relpath(m, abs_base) for m in matches[:100]]
+
+    def _do_glob():
+        matches = _glob.glob(os.path.join(abs_base, pattern), recursive=True)
+        matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return [os.path.relpath(m, abs_base) for m in matches[:100]]
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(_do_glob)
+            results = future.result(timeout=8)
+    except _cf.TimeoutError:
+        return json.dumps(
+            {
+                "error": (
+                    f"list_files timed out scanning '{abs_base}' — the directory is too large. "
+                    "Use run_command with `find <path> -maxdepth 4 -name '<pattern>'` instead."
+                )
+            },
+            ensure_ascii=False,
+        )
+
     return json.dumps(
         {"base": abs_base, "pattern": pattern, "count": len(results), "files": results},
         ensure_ascii=False,
