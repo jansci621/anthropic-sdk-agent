@@ -20,7 +20,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .info-item span { color: #c9d1d9; }
 
 /* Session List */
-#session-list { flex: 1; overflow-y: auto; padding: 8px; }
+#session-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px; }
 #session-list::-webkit-scrollbar { width: 4px; }
 #session-list::-webkit-scrollbar-thumb { background: #30363d; border-radius: 2px; }
 .session-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 4px; transition: background 0.15s; position: relative; }
@@ -126,6 +126,23 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 #file-viewer-toolbar button:hover { background: #30363d; }
 #file-viewer-toolbar .fname { color: #8b949e; font-size: 12px; margin-left: auto; }
 #file-viewer pre { flex: 1; margin: 0; padding: 16px 20px; background: transparent; color: #c9d1d9; font-family: "Cascadia Code", "Fira Code", monospace; font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-all; overflow-y: auto; }
+/* Scheduler panel */
+#scheduler-panel { border-top: 1px solid #21262d; flex-shrink: 0; }
+#scheduler-panel-header { display:flex; align-items:center; gap:6px; padding:10px 16px; cursor:pointer; font-size:13px; color:#8b949e; user-select:none; }
+#scheduler-panel-header:hover { background:#1c2128; }
+#scheduler-badge { background:#388bfd; color:#fff; border-radius:10px; padding:1px 6px; font-size:11px; }
+#scheduler-chevron { margin-left:auto; font-size:10px; }
+#scheduler-log { max-height:240px; overflow-y:auto; padding:6px 8px; }
+.sched-entry { border-radius:6px; background:#161b22; margin-bottom:6px; overflow:hidden; font-size:12px; }
+.sched-entry-hdr { display:flex; justify-content:space-between; align-items:center; padding:5px 10px; cursor:pointer; }
+.sched-entry-hdr:hover { background:#1c2128; }
+.sched-entry-hdr .sched-icon { font-size:11px; margin-right:4px; }
+.sched-entry-hdr .sched-ts { color:#8b949e; font-size:11px; }
+.sched-entry-body { display:none; padding:8px 10px; border-top:1px solid #21262d; max-height:160px; overflow-y:auto; }
+.sched-entry-body.open { display:block; }
+.sched-text { color:#c9d1d9; white-space:pre-wrap; word-break:break-word; line-height:1.5; }
+.sched-tool { color:#79c0ff; font-size:11px; margin:2px 0; }
+.sched-sys { color:#8b949e; font-size:11px; font-style:italic; }
 </style>
 </head>
 <body>
@@ -138,6 +155,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
       <div id="agent-info"></div>
     </div>
     <div id="session-list"></div>
+
+    <!-- Scheduler Panel -->
+    <div id="scheduler-panel">
+      <div id="scheduler-panel-header" onclick="toggleSchedulerPanel()">
+        <span>⏰ Scheduler</span>
+        <span id="scheduler-badge" style="display:none"></span>
+        <span id="scheduler-chevron">▸</span>
+      </div>
+      <div id="scheduler-log" style="display:none"></div>
+    </div>
   </aside>
   <div id="chat-area">
     <div id="conn-status">Connecting...</div>
@@ -245,7 +272,16 @@ async function switchSession(id) {
 function renderHistory(messages) {
   for (const msg of messages) {
     if (msg.role === "user") {
-      const text = typeof msg.content === "string" ? msg.content : "";
+      let text = typeof msg.content === "string" ? msg.content : "";
+      // Skip pure system error messages
+      if (text.startsWith("[SYSTEM")) continue;
+      // For skill-triggered messages, extract only the user-visible request
+      const reqIdx = text.indexOf("\nUser request: ");
+      if (reqIdx !== -1) {
+        text = text.slice(reqIdx + "\nUser request: ".length).trim();
+      } else if (text.startsWith("[Using skill:")) {
+        continue; // skill message with no user request — skip entirely
+      }
       if (text) appendUserBubble(text);
     } else if (msg.role === "assistant") {
       const bubble = appendAssistantBubble();
@@ -364,6 +400,8 @@ function sendMessage(e) {
 
   isProcessing = true;
   document.getElementById("send-btn").disabled = true;
+  // 服务端在 agent 运行前就写了 session 文件，稍等后刷新侧边栏即可显示
+  setTimeout(loadSessions, 300);
   currentAssistantEl = appendAssistantBubble();
   currentPhase = null;
 
@@ -570,18 +608,42 @@ function handleEvent(data) {
       }
       break;
 
-    case "system":
-      appendStatusMsg(data.message, "system-msg");
+    case "system": {
+      const smsg = data.message || "";
+      // Hide empty or pure debug prefixes; show user-visible system messages
+      const sHidden = ["  [API]", "  [Self-heal]", "  [Retry", "  [Context]", "[Error] Model="];
+      if (smsg && !sHidden.some(p => smsg.startsWith(p))) {
+        appendStatusMsg(smsg, "system-msg");
+      }
       break;
+    }
 
-    case "error":
-      appendStatusMsg(data.message, "error-msg");
+    case "error": {
+      const emsg = data.message || "";
+      // Hide raw API/provider errors — they contain technical stack info
+      // that users can't act on (e.g. APIStatusError, code 1214)
+      const isApiErr = emsg.includes("APIStatusError") ||
+                       emsg.includes("APIConnectionError") ||
+                       emsg.includes("API call failed");
+      if (!isApiErr) {
+        appendStatusMsg(emsg, "error-msg");
+      }
       finishAssistant();
       break;
+    }
 
-    case "status":
-      appendStatusMsg(data.message, "status-msg");
+    case "status": {
+      const msg = data.message || "";
+      // Filter internal diagnostic messages — only show user-visible status
+      const hidden = [
+        "  [API]", "  [Self-heal]", "  [Retry", "  [Context]",
+        "[Error] Model=", "  [ReAct]", "  [Router]",
+      ];
+      if (msg && !hidden.some(p => msg.startsWith(p))) {
+        appendStatusMsg(msg, "status-msg");
+      }
       break;
+    }
 
     case "react_header":
       appendStatusMsg(data.message || `ReAct: ${data.query || ""}`, "system-msg");
@@ -649,6 +711,18 @@ async function init() {
   }
 
   loadSessions();
+
+  // On page refresh, reload history for the restored session
+  try {
+    const resp = await fetch(`/api/sessions/${currentSessionId}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.messages && data.messages.length > 0) {
+        renderHistory(data.messages);
+      }
+    }
+  } catch {}
+
   connectWS(() => { loadSessions(); });
 }
 
@@ -782,6 +856,164 @@ function _formatSize(bytes) {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + "K";
   return (bytes / (1024 * 1024)).toFixed(1) + "M";
 }
+
+// ── Scheduler Panel ───────────────────────────────────────────────────────────
+
+let _schedLastTs = null;
+let _schedPanelOpen = false;
+let _schedUnread = 0;
+
+function toggleSchedulerPanel() {
+  _schedPanelOpen = !_schedPanelOpen;
+  document.getElementById("scheduler-log").style.display = _schedPanelOpen ? "block" : "none";
+  document.getElementById("scheduler-chevron").textContent = _schedPanelOpen ? "▾" : "▸";
+  if (_schedPanelOpen) {
+    _schedUnread = 0;
+    const badge = document.getElementById("scheduler-badge");
+    badge.style.display = "none";
+  }
+}
+
+function _replayEventsInto(events, container) {
+  // Accumulate all text_delta into one block (no dependency on text_start)
+  const textParts = [];
+  for (const ev of events) {
+    if (ev.type === "text_delta" && ev.text) {
+      textParts.push(ev.text);
+    } else if (ev.type === "tool_execute" && ev.name) {
+      // Flush pending text first
+      if (textParts.length) {
+        const d = document.createElement("div");
+        d.className = "sched-text";
+        d.textContent = textParts.join("");
+        container.appendChild(d);
+        textParts.length = 0;
+      }
+      const d = document.createElement("div");
+      d.className = "sched-tool";
+      const inp = ev.input;
+      d.textContent = `🔧 ${ev.name}(${typeof inp === "string" ? inp : JSON.stringify(inp)})`;
+      container.appendChild(d);
+    }
+  }
+  if (textParts.length) {
+    const d = document.createElement("div");
+    d.className = "sched-text";
+    d.textContent = textParts.join("");
+    container.appendChild(d);
+  }
+}
+
+function _renderSchedulerEntry(ev) {
+  const log = document.getElementById("scheduler-log");
+  const icon = ev.level === "ok" ? "✓" : ev.level === "error" ? "✗" : "▶";
+  const ts = new Date(ev.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+  // Reuse existing entry for same task — update in place instead of adding a new row
+  const existingId = `sched-task-${ev.task.replace(/\s+/g, "_")}`;
+  let entry = document.getElementById(existingId);
+  let body;
+
+  if (entry) {
+    // Update header and clear body for new result
+    const hdr = entry.querySelector(".sched-entry-hdr");
+    hdr.innerHTML = `<span><span class="sched-icon">${icon}</span>${ev.task}</span><span class="sched-ts">${ts}</span>`;
+    body = entry.querySelector(".sched-entry-body");
+    body.innerHTML = "";
+    log.prepend(entry);  // move to top
+  } else {
+    entry = document.createElement("div");
+    entry.className = "sched-entry";
+    entry.id = existingId;
+
+    const hdr = document.createElement("div");
+    hdr.className = "sched-entry-hdr";
+    hdr.innerHTML = `<span><span class="sched-icon">${icon}</span>${ev.task}</span><span class="sched-ts">${ts}</span>`;
+
+    body = document.createElement("div");
+    body.className = "sched-entry-body";
+
+    hdr.onclick = () => body.classList.toggle("open");
+    entry.appendChild(hdr);
+    entry.appendChild(body);
+    log.prepend(entry);
+  }
+
+  if (ev.events && ev.events.length > 0) {
+    _replayEventsInto(ev.events, body);
+  } else {
+    const d = document.createElement("div");
+    d.className = "sched-sys";
+    d.textContent = ev.msg || "";
+    body.appendChild(d);
+  }
+
+  body.classList.add("open");
+}
+
+async function _reloadCurrentSessionHistory() {
+  try {
+    const resp = await fetch(`/api/sessions/${currentSessionId}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (!data.messages) return;
+    const area = document.getElementById("messages");
+    area.innerHTML = "";
+    currentAssistantEl = null;
+    currentPhase = null;
+    renderHistory(data.messages);
+    scrollBottom();
+  } catch {}
+}
+
+async function _pollSchedulerEvents() {
+  try {
+    const url = _schedLastTs
+      ? `/api/schedule/events?since=${encodeURIComponent(_schedLastTs)}`
+      : "/api/schedule/events";
+    const resp = await fetch(url);
+    if (!resp.ok) return;
+    const events = await resp.json();
+
+    // 无论是否有 ok 事件，先推进时间戳，避免重复拉取同批 info 事件
+    if (events.length > 0) {
+      _schedLastTs = events[events.length - 1].ts;
+    }
+
+    const newEvents = events.filter(e => e.level !== "info");
+    if (newEvents.length === 0) return;
+
+    for (const ev of newEvents) {
+      if (ev.level === "deleted") {
+        // 删除任务后从面板移除对应条目
+        const entryId = `sched-task-${ev.task.replace(/\s+/g, "_")}`;
+        const el = document.getElementById(entryId);
+        if (el) el.remove();
+      } else {
+        _renderSchedulerEntry(ev);
+        // 若用户正在查看该任务的专属 session，自动刷新聊天区
+        if (ev.session_id && ev.session_id === currentSessionId && ev.level === "ok") {
+          _reloadCurrentSessionHistory();
+        }
+      }
+    }
+
+    if (!_schedPanelOpen) {
+      // Auto-open panel on first scheduler result
+      toggleSchedulerPanel();
+    } else {
+      _schedUnread = 0;
+    }
+  } catch (err) {
+    console.error("[Scheduler] poll error:", err);
+  }
+}
+
+// Initialize: load existing events once, then poll every 5s
+(async () => {
+  await _pollSchedulerEvents();
+  setInterval(_pollSchedulerEvents, 5000);
+})();
 </script>
 </body>
 </html>

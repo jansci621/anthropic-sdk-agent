@@ -20,6 +20,7 @@ from reflexion import ReflexionAgent
 from fast_rules import FastRuleEngine
 from evolution import CoEvolutionCoordinator
 from rag import RAGSystem, RAG_TOOL, handle_rag_tool
+from scheduler import SCHEDULER_TOOLS, handle_scheduler_tool
 from web_tools import WEB_TOOLS, handle_web_tool
 from shell_tools import SHELL_TOOLS, handle_shell_tool
 from event_bus import (
@@ -47,6 +48,10 @@ class Agent:
         system_prompt: str = config.SYSTEM_PROMPT,
         event_bus: 'EventBus | None' = None,
     ):
+        # Execution lock — prevents concurrent _agent_loop calls from scheduler + web sessions
+        import threading as _threading
+        self._execution_lock = _threading.Lock()
+
         # Event bus for output abstraction
         from event_bus import EventBus, CLIPrintSink
         if event_bus is not None:
@@ -113,7 +118,7 @@ class Agent:
 
         # Tools: base tools + skill scripts
         skill_tools = [t for s in self.skills.values() for t in s.tools]
-        self.tools = [*MEMORY_TOOLS, RAG_TOOL, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
+        self.tools = [*MEMORY_TOOLS, RAG_TOOL, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
 
         # System prompt: base + CLAUDE.md + skill prompts + references
         self.system = self._build_system_prompt(system_prompt)
@@ -146,7 +151,7 @@ class Agent:
             print(f"CWD CLAUDE.md: {config.CWD_CLAUDE_MD}")
         route_status = "auto-routing ON" if config.AUTO_ROUTE else "auto-routing OFF (set AI_AUTO_ROUTE=true)"
         print(f"Routing: {route_status}")
-        print(f"Type /quit to exit, /clear to reset, /react <query> to force ReAct, /skills to list{config.COLOR_RESET}\n")
+        print(f"Type /quit to exit, /clear to reset, /react <query> to force ReAct, /skills to list, /schedule to manage tasks{config.COLOR_RESET}\n")
 
         while True:
             try:
@@ -165,6 +170,11 @@ class Agent:
             if user_input.lower() == "/clear":
                 self.conversation.clear()
                 print(f"{config.COLOR_SYSTEM}Conversation cleared.{config.COLOR_RESET}\n")
+                continue
+
+            # ── Schedule commands (/schedule ...) ───────────────────────────
+            if user_input.lower().startswith("/schedule"):
+                self._cmd_schedule(user_input)
                 continue
 
             # ── ReAct mode (/react <query>) ─────────────────────────────────
@@ -220,6 +230,83 @@ class Agent:
             self._agent_loop()
 
     # ── Skill Commands ────────────────────────────────────────────────────
+
+    def _cmd_schedule(self, user_input: str):
+        """Handle /schedule CLI commands."""
+        from scheduler import task_scheduler, ScheduledTask, ScheduleConfig, ActionConfig
+        parts = user_input.strip().split(None, 2)
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+
+        C = config.COLOR_SYSTEM
+        R = config.COLOR_RESET
+        T = config.COLOR_TOOL
+
+        if sub == "list":
+            tasks = task_scheduler.list_tasks()
+            if not tasks:
+                print(f"{C}No scheduled tasks.{R}\n")
+                return
+            print(f"{C}Scheduled Tasks:{R}")
+            for t in tasks:
+                status = "▶" if t.enabled else "⏸"
+                nxt = t.next_run[:19] if t.next_run else "—"
+                print(f"  {status} {T}{t.id}{R}  {t.name}  next={nxt}  last={t.last_result[:40] if t.last_result else '—'}")
+            print()
+
+        elif sub == "pause" and len(parts) > 2:
+            task_id = parts[2].strip()
+            if task_scheduler.pause_task(task_id):
+                print(f"{C}Task {task_id} paused.{R}\n")
+            else:
+                print(f"{C}Task {task_id} not found.{R}\n")
+
+        elif sub == "resume" and len(parts) > 2:
+            task_id = parts[2].strip()
+            if task_scheduler.resume_task(task_id):
+                print(f"{C}Task {task_id} resumed.{R}\n")
+            else:
+                print(f"{C}Task {task_id} not found.{R}\n")
+
+        elif sub == "delete" and len(parts) > 2:
+            task_id = parts[2].strip()
+            if task_scheduler.remove_task(task_id):
+                print(f"{C}Task {task_id} deleted.{R}\n")
+            else:
+                print(f"{C}Task {task_id} not found.{R}\n")
+
+        elif sub == "run" and len(parts) > 2:
+            task_id = parts[2].strip()
+            if task_scheduler.run_now(task_id):
+                print(f"{C}Task {task_id} triggered.{R}\n")
+            else:
+                print(f"{C}Task {task_id} not found.{R}\n")
+
+        elif sub == "add" and len(parts) > 2:
+            import json as _json
+            try:
+                body = _json.loads(parts[2])
+                task = ScheduledTask(
+                    id="",
+                    name=body.get("name", "Unnamed"),
+                    schedule=ScheduleConfig(**body["schedule"]),
+                    action=ActionConfig(**body["action"]),
+                    enabled=body.get("enabled", True),
+                )
+                task = task_scheduler.add_task(task)
+                print(f"{C}Task created: {task.id} — {task.name}{R}\n")
+            except Exception as e:
+                print(f"{C}Error: {e}{R}")
+                print(f"{C}Usage: /schedule add {{\"name\":\"...\",\"schedule\":{{\"type\":\"cron\",\"expr\":\"0 8 * * *\"}},\"action\":{{\"type\":\"query\",\"query\":\"...\"}}}}{R}\n")
+
+        else:
+            print(f"""{C}Schedule commands:
+  /schedule list
+  /schedule add <json>
+  /schedule pause <id>
+  /schedule resume <id>
+  /schedule delete <id>
+  /schedule run <id>    ← trigger immediately{R}
+""")
 
     def _cmd_list_skills(self):
         """List all loaded skills."""
@@ -1139,6 +1226,9 @@ class Agent:
                         pass
                 return result
         # Global tools
+        if name in ("create_scheduled_task", "list_scheduled_tasks", "cancel_scheduled_task"):
+            session_id = getattr(self, '_current_session_id', '')
+            return handle_scheduler_tool(name, tool_input, session_id=session_id)
         if name in ("save_memory", "search_memory"):
             return handle_memory_tool(name, tool_input, self.memory)
         if name == "search_documents":

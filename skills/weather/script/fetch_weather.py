@@ -4,6 +4,7 @@
 """
 
 import json
+import socket
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -16,7 +17,7 @@ def run(params: dict) -> str:
         return json.dumps({"error": "city parameter is required"}, ensure_ascii=False)
 
     try:
-        url = f"https://wttr.in/{urllib.parse.quote(city)}?format=j1"
+        url = f"https://wttr.in/{urllib.parse.quote(city)}?format=j1&lang=zh"
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "curl/7.68.0"},
@@ -25,7 +26,14 @@ def run(params: dict) -> str:
         with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        current = data.get("current_condition", [{}])[0]
+        current_condition = data.get("current_condition", [])
+        if not current_condition:
+            return json.dumps(
+                {"status": "error", "city": city, "error": f"Failed to fetch weather data for '{city}'. The location might be ambiguous or unsupported by the weather service. Try providing a more specific city name (e.g., '平湖市,Pinghu' or 'Pinghu,Zhejiang')."},
+                ensure_ascii=False,
+            )
+
+        current = current_condition[0]
 
         return json.dumps(
             {
@@ -45,13 +53,19 @@ def run(params: dict) -> str:
         )
 
     except urllib.error.HTTPError as e:
+        if e.code == 500:
+            return json.dumps(
+                {"status": "error", "city": city, "error": f"Failed to fetch weather data for '{city}'. The location might be ambiguous or unsupported by the weather service. Try providing a more specific city name (e.g., '平湖市,Pinghu' or 'Pinghu,Zhejiang')."},
+                ensure_ascii=False,
+            )
         return json.dumps(
             {"status": "error", "city": city, "error": f"HTTP {e.code}: {e.reason}"},
             ensure_ascii=False,
         )
-    except urllib.error.URLError as e:
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        reason = getattr(e, 'reason', str(e))
         return json.dumps(
-            {"status": "error", "city": city, "error": f"Network Error: {str(e.reason)}"},
+            {"status": "error", "city": city, "error": f"Network Error: Failed to connect to the weather service due to a timeout. Please check your network connection and try again later."},
             ensure_ascii=False,
         )
     except Exception as e:

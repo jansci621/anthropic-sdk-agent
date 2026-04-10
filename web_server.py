@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,6 +13,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Fil
 from fastapi.staticfiles import StaticFiles
 
 from agent import Agent
+from scheduler import (
+    task_scheduler, ScheduledTask, ScheduleConfig, ActionConfig,
+    get_scheduler_events,
+)
 
 import config
 from event_bus import EventBus, AsyncQueueSink, CLIPrintSink, EVENT_SYSTEM
@@ -20,7 +25,56 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "data", "sessions")
 WORKSPACES_DIR = os.path.join(BASE_DIR, "data", "workspaces")
 
-app = FastAPI(title="AI Agent Web UI")
+
+def _session_updater(session_id: str, task_name: str, events: list[dict]):
+    """Append scheduler task result to a DEDICATED session for this task.
+
+    Each scheduled task gets its own session (id = "sched_<task_hash>") so
+    results never contaminate the session where the task was created.
+    """
+    from scheduler import dedicated_session_id as _ded_id
+    text = "".join(ev.get("text", "") for ev in events if ev.get("type") == "text_delta")
+    if not text.strip():
+        return
+
+    # Stable dedicated session id based on task name (same formula as scheduler.py)
+    dedicated_id = _ded_id(task_name)
+
+    # Ensure the session exists in memory
+    if dedicated_id not in _sessions:
+        agent, bus = _get_shared_agent()
+        saved = _load_session(dedicated_id)
+        snapshot = saved["messages"] if saved and saved.get("messages") else []
+        _sessions[dedicated_id] = {"agent": agent, "bus": bus, "_conv_snapshot": list(snapshot)}
+
+    session = _sessions[dedicated_id]
+    synthetic = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": text.strip()}],
+    }
+    snapshot = list(session.get("_conv_snapshot", []))
+
+    # Add a user-role "header" message if this is the first result
+    if not snapshot:
+        snapshot.append({"role": "user", "content": f"⏰ {task_name}"})
+
+    snapshot.append(synthetic)
+    session["_conv_snapshot"] = snapshot
+    _save_session(dedicated_id, snapshot)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ───────────────────────────────────────────────────────────
+    task_scheduler.set_agent_getter(_get_shared_agent)
+    task_scheduler.set_session_updater(_session_updater)
+    task_scheduler.start()
+    yield
+    # ── Shutdown ──────────────────────────────────────────────────────────
+    task_scheduler.stop()
+
+
+app = FastAPI(title="AI Agent Web UI", lifespan=lifespan)
 
 # Serve static files
 app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "web", "static")), name="static")
@@ -128,8 +182,17 @@ def _save_session(session_id: str, conversation: list):
                     text = b.get("text", "")
                     break
         if msg.get("role") == "user" and text:
-            title = text[:40].replace("\n", " ")
-            if len(text) > 40:
+            if text.startswith("[SYSTEM"):
+                continue
+            # For skill-triggered messages, extract only the user-visible request
+            req_marker = "\nUser request: "
+            idx = text.find(req_marker)
+            if idx != -1:
+                text = text[idx + len(req_marker):]
+            elif text.startswith("[Using skill:"):
+                continue  # skill message with no user request — skip
+            title = text.strip()[:40].replace("\n", " ")
+            if len(text.strip()) > 40:
                 title += "..."
             break
 
@@ -169,6 +232,29 @@ def _load_session(session_id: str) -> dict | None:
         return None
 
 
+def _clean_title_from_messages(messages: list) -> str:
+    """Re-derive a clean title from stored messages, skipping injected system messages."""
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        text = msg.get("content", "")
+        if not isinstance(text, str):
+            continue
+        if text.startswith("[SYSTEM"):
+            continue
+        req_marker = "\nUser request: "
+        idx = text.find(req_marker)
+        if idx != -1:
+            text = text[idx + len(req_marker):]
+        elif text.startswith("[Using skill:"):
+            continue  # skill message with no user request — skip
+        text = text.strip()
+        if text:
+            title = text[:40].replace("\n", " ")
+            return title + ("..." if len(text) > 40 else "")
+    return "New Chat"
+
+
 def _list_sessions() -> list[dict]:
     """List all sessions sorted by most recent first."""
     if not os.path.exists(SESSIONS_DIR):
@@ -181,9 +267,13 @@ def _list_sessions() -> list[dict]:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            title = data.get("title", "Untitled")
+            # Retroactively clean stale titles from system-injected messages
+            if title.startswith("[SYSTEM") or title.startswith("[Using skill:"):
+                title = _clean_title_from_messages(data.get("messages", []))
             sessions.append({
                 "id": data.get("id", fname[:-5]),
-                "title": data.get("title", "Untitled"),
+                "title": title,
                 "created": data.get("created", ""),
                 "updated": data.get("updated", ""),
             })
@@ -406,6 +496,16 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             if not user_message:
                 continue
 
+            # Pre-save immediately — before acquiring any lock — so the session
+            # appears in the sidebar right away (frontend polls 300ms after send)
+            try:
+                _save_session(
+                    session_id,
+                    list(session.get("_conv_snapshot", [])) + [{"role": "user", "content": user_message}],
+                )
+            except Exception:
+                pass
+
             loop = asyncio.get_running_loop()
 
             # ── Run agent under lock (prevents concurrent executor on shared agent) ──
@@ -417,13 +517,25 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     # Restore this session's conversation into the shared agent
                     agent.conversation = list(session.get("_conv_snapshot", []))
                     agent._workspace_dir = _get_workspace(session_id)
+                    agent._current_session_id = session_id  # for scheduler tool to bind task to session
+
+                    def _locked(fn, *a):
+                        """Run agent method under execution lock to prevent scheduler races."""
+                        with agent._execution_lock:
+                            fn(*a)
 
                     # Natural language skill matching
                     skill_match = agent._match_skill_natural(user_message)
                     if skill_match:
                         skill_name, args = skill_match
                         bus.emit(EVENT_SYSTEM, {"message": f"[Skill → {skill_name}]"})
-                        await loop.run_in_executor(None, agent._trigger_skill, skill_name, args)
+                        # Pre-save with user message so the session appears in sidebar immediately
+                        try:
+                            _save_session(session_id,
+                                          list(agent.conversation) + [{"role": "user", "content": user_message}])
+                        except Exception:
+                            pass
+                        await loop.run_in_executor(None, _locked, agent._trigger_skill, skill_name, args)
                         bus.emit(EVENT_SYSTEM, {"message": ""})
                         try:
                             conv_copy = list(agent.conversation)
@@ -461,11 +573,11 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     except Exception:
                         pass
 
-                    # Run agent (only one at a time — lock guarantees this)
+                    # Run agent (only one at a time — execution_lock prevents scheduler races)
                     if use_react:
-                        await loop.run_in_executor(None, agent._run_react, user_message)
+                        await loop.run_in_executor(None, _locked, agent._run_react, user_message)
                     else:
-                        await loop.run_in_executor(None, agent._agent_loop)
+                        await loop.run_in_executor(None, _locked, agent._agent_loop)
                     bus.emit(EVENT_SYSTEM, {"message": ""})
 
                     # Save after agent turn
@@ -493,3 +605,88 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             _save_session(session_id, list(snapshot))
         except Exception:
             pass
+
+
+# ── Schedule API ──────────────────────────────────────────────────────────────
+
+@app.get("/api/schedule/events")
+async def schedule_events(since: str | None = None):
+    """
+    Return scheduler execution events (independent of sessions).
+    Optionally filter by ?since=<ISO-8601> to get only newer events.
+    Poll this endpoint every few seconds to show scheduler activity in the UI.
+    """
+    return JSONResponse(get_scheduler_events(since))
+
+
+@app.get("/api/schedule/tasks")
+async def schedule_list():
+    return JSONResponse([t.to_dict() for t in task_scheduler.list_tasks()])
+
+
+@app.post("/api/schedule/tasks")
+async def schedule_add(body: dict):
+    """
+    Body example:
+    {
+      "name": "Daily weather",
+      "schedule": {"type": "cron", "expr": "0 8 * * *"},
+      "action":   {"type": "skill", "skill": "weather", "args": "Beijing"}
+    }
+    """
+    try:
+        task = ScheduledTask(
+            id="",
+            name=body.get("name", "Unnamed task"),
+            schedule=ScheduleConfig(**body["schedule"]),
+            action=ActionConfig(**body["action"]),
+            enabled=body.get("enabled", True),
+        )
+    except (KeyError, TypeError) as e:
+        return JSONResponse({"error": f"Invalid body: {e}"}, status_code=400)
+    task = task_scheduler.add_task(task)
+    return JSONResponse(task.to_dict(), status_code=201)
+
+
+@app.get("/api/schedule/tasks/{task_id}")
+async def schedule_get(task_id: str):
+    task = task_scheduler.get_task(task_id)
+    if not task:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse(task.to_dict())
+
+
+@app.patch("/api/schedule/tasks/{task_id}")
+async def schedule_update(task_id: str, body: dict):
+    task = task_scheduler.update_task(task_id, body)
+    if not task:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse(task.to_dict())
+
+
+@app.delete("/api/schedule/tasks/{task_id}")
+async def schedule_delete(task_id: str):
+    if not task_scheduler.remove_task(task_id):
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse({"status": "deleted"})
+
+
+@app.post("/api/schedule/tasks/{task_id}/run")
+async def schedule_run_now(task_id: str):
+    if not task_scheduler.run_now(task_id):
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse({"status": "triggered"})
+
+
+@app.post("/api/schedule/tasks/{task_id}/pause")
+async def schedule_pause(task_id: str):
+    if not task_scheduler.pause_task(task_id):
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse({"status": "paused"})
+
+
+@app.post("/api/schedule/tasks/{task_id}/resume")
+async def schedule_resume(task_id: str):
+    if not task_scheduler.resume_task(task_id):
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse({"status": "resumed"})

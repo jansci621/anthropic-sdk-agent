@@ -21,12 +21,17 @@ def main():
         uvicorn.run(app, host=args.host, port=args.port)
     else:
         from agent import Agent
+        from scheduler import task_scheduler
 
         try:
             agent = Agent()
+            task_scheduler.set_agent_getter(lambda: (agent, agent.event_bus))
+            task_scheduler.start()
             agent.run()
         except KeyboardInterrupt:
             print("\n\nGoodbye!")
+        finally:
+            task_scheduler.stop()
             sys.exit(0)
 
 
