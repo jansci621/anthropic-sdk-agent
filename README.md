@@ -17,6 +17,7 @@
 - **自我进化 (E1-E6)** — 经验注入、提示词进化、工具可靠性追踪、反思学习、快规则引擎、协同进化
 - **ReAct 模式** — 显式 Thought → Action → Observation 循环，每步可追溯
 - **自动路由** — 根据查询特征自动选择 ReAct 或通用模式
+- **定时任务系统** — 自然语言创建 cron/interval/once 三类定时任务，结果自动写入专属 session，侧边栏 ⏰ 面板实时展示
 
 ## 环境要求
 
@@ -110,6 +111,12 @@ You:
 | `/<skill_name> [args]` | 触发指定技能 |
 | `+skill <name>` | 热加载技能 |
 | `-skill <name>` | 卸载技能 |
+| `/schedule list` | 列出所有定时任务 |
+| `/schedule add <json>` | 新增定时任务 |
+| `/schedule pause <id>` | 暂停任务 |
+| `/schedule resume <id>` | 恢复任务 |
+| `/schedule delete <id>` | 删除任务 |
+| `/schedule run <id>` | 立即触发一次 |
 
 ## ReAct 推理模式
 
@@ -152,6 +159,59 @@ The self-healing system has 7 layers: ...
 
 [ReAct] Completed in 2 step(s).
 ```
+
+## 定时任务系统
+
+Agent 内置定时任务调度器，支持通过自然语言创建、管理自动化任务。
+
+### 创建任务（自然语言）
+
+直接在对话中描述需求，Agent 会自动创建对应任务：
+
+```
+你: 帮我每分钟查询一次上海天气
+Agent: → 调用 create_scheduled_task 工具，创建 interval 任务
+       → 每 60 秒自动执行，结果写入专属 session
+```
+
+### 任务类型
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| `interval` | 固定间隔重复 | 每 60 秒查天气 |
+| `cron` | 标准 cron 表达式 | `0 8 * * 1-5` 工作日早 8 点 |
+| `once` | 指定时间执行一次 | 明天上午 9 点提醒 |
+
+### 动作类型
+
+| 类型 | 说明 |
+|------|------|
+| `skill` | 触发一个已加载的技能 |
+| `query` | 向 Agent 发送一次查询 |
+
+### Web UI 面板
+
+侧边栏底部的 ⏰ Scheduler 面板展示所有任务的最近执行结果，有新结果时自动弹出。每个任务有独立的专属 session，结果按时间追加，页面打开时自动刷新。
+
+### REST API
+
+```
+GET    /api/schedule/tasks              列出所有任务
+POST   /api/schedule/tasks              创建任务
+GET    /api/schedule/tasks/{id}         查看单个任务
+PATCH  /api/schedule/tasks/{id}         更新任务
+DELETE /api/schedule/tasks/{id}         删除任务
+POST   /api/schedule/tasks/{id}/run     立即触发
+POST   /api/schedule/tasks/{id}/pause   暂停
+POST   /api/schedule/tasks/{id}/resume  恢复
+GET    /api/schedule/events             执行日志（支持 ?since=<ISO-8601>）
+```
+
+### 持久化
+
+任务定义保存在 `data/scheduled_tasks.json`，重启后自动恢复调度。
+
+---
 
 ## 自动路由
 
@@ -244,6 +304,7 @@ anthropic-sdk-agent/
 ├── router.py               # 自动路由：快规则 + LLM 分类器
 ├── memory.py               # 持久化记忆系统
 ├── rag.py                  # RAG 文档检索（FAISS + BM25 混合，V3 语义分块，embedding 缓存）
+├── scheduler.py            # 定时任务调度器（APScheduler，cron/interval/once，持久化）
 ├── file_tools.py           # 文件操作工具
 ├── web_tools.py            # Web 工具（URL 抓取、搜索）
 ├── shell_tools.py          # Shell 命令工具
@@ -265,7 +326,8 @@ anthropic-sdk-agent/
 │   ├── experiences.json    # 经验存储
 │   ├── evolved_prompt.md   # 进化后的提示词
 │   ├── fast_rules.json     # 快规则数据
-│   └── tool_stats.json     # 工具统计
+│   ├── tool_stats.json     # 工具统计
+│   └── scheduled_tasks.json  # 定时任务定义（持久化）
 ├── web/
 │   └── static/
 │       └── index.html      # Web UI 前端（DeepSeek 风格）

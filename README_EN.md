@@ -17,6 +17,7 @@ An intelligent agent built on the Anthropic SDK, featuring persistent memory, RA
 - **Self-evolution (E1-E6)** — Experience injection, prompt evolution, tool reliability tracking, reflective learning, fast-rule engine, co-evolution
 - **ReAct mode** — Explicit Thought → Action → Observation loop with full traceability at each step
 - **Auto-routing** — Automatically selects ReAct or general mode based on query characteristics
+- **Scheduled tasks** — Create cron/interval/once tasks in natural language; results written to a dedicated session and displayed live in the ⏰ sidebar panel
 
 ## Requirements
 
@@ -110,6 +111,12 @@ You:
 | `/<skill_name> [args]` | Trigger a specific skill |
 | `+skill <name>` | Hot-load a skill |
 | `-skill <name>` | Unload a skill |
+| `/schedule list` | List all scheduled tasks |
+| `/schedule add <json>` | Create a scheduled task |
+| `/schedule pause <id>` | Pause a task |
+| `/schedule resume <id>` | Resume a task |
+| `/schedule delete <id>` | Delete a task |
+| `/schedule run <id>` | Trigger immediately |
 
 ## ReAct Reasoning Mode
 
@@ -152,6 +159,59 @@ The self-healing system has 7 layers: ...
 
 [ReAct] Completed in 2 step(s).
 ```
+
+## Scheduled Tasks
+
+The agent has a built-in task scheduler. Create and manage automated tasks using natural language.
+
+### Create a task (natural language)
+
+Simply describe what you need in the chat:
+
+```
+You: Check Shanghai weather every minute
+Agent: → calls create_scheduled_task, creates an interval task
+       → runs every 60 seconds, results written to a dedicated session
+```
+
+### Schedule types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `interval` | Fixed interval repeat | Every 60 seconds |
+| `cron` | Standard cron expression | `0 8 * * 1-5` weekdays at 8am |
+| `once` | Run once at a specific time | Tomorrow at 9am |
+
+### Action types
+
+| Type | Description |
+|------|-------------|
+| `skill` | Trigger a loaded skill |
+| `query` | Send a query through the agent |
+
+### Web UI panel
+
+The ⏰ Scheduler panel at the bottom of the sidebar shows recent execution results for all tasks and auto-opens when new results arrive. Each task has its own dedicated session; results are appended over time and the page auto-refreshes.
+
+### REST API
+
+```
+GET    /api/schedule/tasks              List all tasks
+POST   /api/schedule/tasks              Create a task
+GET    /api/schedule/tasks/{id}         Get a task
+PATCH  /api/schedule/tasks/{id}         Update a task
+DELETE /api/schedule/tasks/{id}         Delete a task
+POST   /api/schedule/tasks/{id}/run     Trigger immediately
+POST   /api/schedule/tasks/{id}/pause   Pause
+POST   /api/schedule/tasks/{id}/resume  Resume
+GET    /api/schedule/events             Execution log (?since=<ISO-8601>)
+```
+
+### Persistence
+
+Task definitions are saved to `data/scheduled_tasks.json` and automatically restored on restart.
+
+---
 
 ## Auto-routing
 
@@ -244,6 +304,7 @@ anthropic-sdk-agent/
 ├── router.py               # Auto-router: fast rules + LLM classifier
 ├── memory.py               # Persistent memory system
 ├── rag.py                  # RAG retrieval (FAISS + BM25 hybrid, V3 semantic chunking, embedding cache)
+├── scheduler.py            # Task scheduler (APScheduler, cron/interval/once, persistent)
 ├── file_tools.py           # File operation tools
 ├── web_tools.py            # Web tools (URL fetch, search)
 ├── shell_tools.py          # Shell command tool
@@ -264,8 +325,9 @@ anthropic-sdk-agent/
 │   ├── memories.json       # Memory store
 │   ├── experiences.json    # Experience store
 │   ├── evolved_prompt.md   # Evolved prompt
-│   ├── fast_rules.json     # Fast-rule data
-│   └── tool_stats.json     # Tool statistics
+│   ├── fast_rules.json       # Fast-rule data
+│   ├── tool_stats.json       # Tool statistics
+│   └── scheduled_tasks.json  # Scheduled task definitions (persistent)
 ├── web/
 │   └── static/
 │       └── index.html      # Web UI frontend (DeepSeek style)
