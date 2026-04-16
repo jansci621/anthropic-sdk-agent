@@ -6,3 +6,16 @@ CLAUDE.md
 memory/*.md
 *.env
 docs/
+
+# Runtime data (auto-generated)
+data/
+
+# Knowledge base (local documents, not for version control)
+knowledge_base/
+
+# Kubernetes config files (sensitive)
+.kube_config*
+generate_readonly_kubeconfig.sh
+
+# Backup files
+*.bak
