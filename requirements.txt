@@ -1,7 +1,7 @@
 anthropic>=0.52.0
 sentence-transformers>=3.0.0
 numpy>=1.26.0
-faiss-cpu>=1.7.0
+qdrant-client>=1.9.0
 python-dotenv>=1.0.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
@@ -9,5 +9,12 @@ rank-bm25>=0.2.2
 pypdf>=4.0.0
 pdfplumber>=0.11.0
 apscheduler>=3.10.0
+# Optional — API embedding providers (no local HuggingFace model needed)
+# voyageai>=0.2.3
+# openai>=1.0.0
+# Optional — Neo4j GraphRAG (requires running Neo4j instance)
+# neo4j>=5.0.0
+# Optional — FAISS fallback (if qdrant-client unavailable)
+# faiss-cpu>=1.7.0
 # Optional — P3 visual table fallback (requires ghostscript system package)
 # camelot-py[cv]>=0.11.0

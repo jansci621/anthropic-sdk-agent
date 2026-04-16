@@ -114,6 +114,22 @@ CHUNK_SIZE = 500       # approximate tokens per chunk
 CHUNK_OVERLAP = 50     # token overlap between chunks
 TOP_K_RESULTS = 3      # number of results to retrieve
 
+# Qdrant vector store (local persistent mode — no server needed)
+# Set AI_QDRANT_COLLECTION to use a different collection name
+QDRANT_COLLECTION = os.environ.get("AI_QDRANT_COLLECTION", "knowledge_base")
+
+# ── Embedding Provider ───────────────────────────────────────────────────────
+# EMBEDDING_PROVIDER: "local" (sentence-transformers, default),
+#                     "voyage" (Voyage AI API),
+#                     "openai" (OpenAI text-embedding-3-small)
+# When using an API provider, no HuggingFace model download is needed.
+EMBEDDING_PROVIDER = os.environ.get("AI_EMBEDDING_PROVIDER", "local").lower()
+VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# Model names for API providers (override with env vars if needed)
+VOYAGE_EMBEDDING_MODEL = os.environ.get("AI_VOYAGE_MODEL", "voyage-3-lite")
+OPENAI_EMBEDDING_MODEL = os.environ.get("AI_OPENAI_MODEL", "text-embedding-3-small")
+
 # ── ANSI Colors ─────────────────────────────────────────────────────────────
 COLOR_THINKING = "\033[2;36m"   # dim cyan
 COLOR_TOOL = "\033[33m"         # yellow

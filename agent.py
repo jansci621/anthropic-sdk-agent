@@ -64,6 +64,7 @@ from reflexion import ReflexionAgent
 from fast_rules import FastRuleEngine
 from evolution import CoEvolutionCoordinator
 from rag import RAGSystem, RAG_TOOL, handle_rag_tool
+from graph_rag import GraphRAGSystem
 from scheduler import SCHEDULER_TOOLS, handle_scheduler_tool
 from web_tools import WEB_TOOLS, handle_web_tool
 from shell_tools import SHELL_TOOLS, handle_shell_tool
@@ -78,6 +79,38 @@ from file_tools import FILE_TOOLS, handle_file_tool
 from skills import discover_skills
 from react import ReActLoop
 from router import QueryRouter
+
+
+# ── GraphRAG tool schema ──────────────────────────────────────────────────────
+
+_GRAPH_SEARCH_TOOL = {
+    "name": "graph_search",
+    "description": (
+        "Search the knowledge graph for entity relationships and multi-hop connections. "
+        "Use this when the user asks about relationships between concepts, root causes, "
+        "or questions that require connecting multiple pieces of information (e.g. 'how is "
+        "A related to B?', 'what causes X?'). Returns entity-relation-entity triples "
+        "gathered by graph traversal from Neo4j."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language query describing what relationships to find",
+            },
+            "hops": {
+                "type": "integer",
+                "description": "How many relationship hops to traverse (1 or 2, default 2)",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Maximum number of results to return (default 5)",
+            },
+        },
+        "required": ["query"],
+    },
+}
 
 
 class Agent:
@@ -136,6 +169,7 @@ class Agent:
         self.memory = MemoryStore()
         _noop = _Noop()
         self.rag = RAGSystem() if not lightweight else None
+        self.graph_rag = GraphRAGSystem(self.client) if not lightweight else None
         self.repair_agent = RepairAgent(self.client)
         self.script_repairer = ScriptRepairer(self.client)
         self.experience = ExperienceStore() if not lightweight else _noop
@@ -173,7 +207,9 @@ class Agent:
         skill_tools = [t for s in self.skills.values() for t in s.tools]
         # RAG tool only available when RAG is loaded (not in lightweight mode)
         _rag_tools = [RAG_TOOL] if self.rag is not None else []
-        self.tools = [*MEMORY_TOOLS, *_rag_tools, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
+        # GraphRAG tool only available when Neo4j is connected
+        _graph_tools = [_GRAPH_SEARCH_TOOL] if (self.graph_rag and self.graph_rag.available) else []
+        self.tools = [*MEMORY_TOOLS, *_rag_tools, *_graph_tools, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
 
         # System prompt: base + CLAUDE.md + skill prompts + references
         self.system = self._build_system_prompt(system_prompt)
@@ -1581,6 +1617,14 @@ class Agent:
             if extra:
                 tool_input = dict(tool_input, extra_queries=extra)
             return handle_rag_tool(tool_input, self.rag)
+        if name == "graph_search":
+            if not (self.graph_rag and self.graph_rag.available):
+                return json.dumps({"error": "GraphRAG not available (Neo4j not connected)"})
+            query   = tool_input.get("query", "")
+            hops    = int(tool_input.get("hops", 2))
+            top_k   = int(tool_input.get("top_k", 5))
+            results = self.graph_rag.search(query, hops=hops, max_results=top_k)
+            return json.dumps({"query": query, "results": results}, ensure_ascii=False)
         if name in ("read_file", "write_file", "list_files", "search_content"):
             return handle_file_tool(name, tool_input, workspace_root=self._workspace_dir)
         if name in ("fetch_url", "web_search"):

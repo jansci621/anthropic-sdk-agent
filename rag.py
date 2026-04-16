@@ -366,12 +366,14 @@ def _is_table_row(line: str) -> bool:
 # ── RAG System ──────────────────────────────────────────────────────────────
 
 class RAGSystem:
-    """Document retrieval using local sentence embeddings and FAISS + BM25.
+    """Document retrieval using local sentence embeddings and Qdrant + BM25.
 
     Advanced retrieval features:
       - Multi-granularity indexing (child chunks for retrieval, parent for context)
+      - Qdrant local persistent vector store (HNSW, no server required)
       - Cross-encoder reranking (optional, activated when sentence-transformers cross-encoder is available)
       - HyDE support (caller passes hypothetical document via extra_queries)
+      - Numpy dot-product fallback when qdrant-client is not installed
     """
 
     _CACHE_SUBDIR = ".rag_cache"
@@ -392,11 +394,12 @@ class RAGSystem:
         self.chunk_overlap = chunk_overlap
         self.top_k = top_k
         self._cache_dir = os.path.join(knowledge_base_dir, self._CACHE_SUBDIR)
+        self._collection_name = config.QDRANT_COLLECTION
 
         # child chunks: used for bi-encoder retrieval (fine-grained)
         self.chunks: list[dict] = []
         self.embeddings: np.ndarray | None = None
-        self.index = None
+        self._qdrant = None   # QdrantClient instance (None = numpy fallback)
         self._bm25 = None
 
         # parent chunks: returned to caller for full context
@@ -410,7 +413,8 @@ class RAGSystem:
         self.model = self._load_embedding_model(embedding_model)
         self._load_and_index()
         rerank_status = "cross-encoder" if self._cross_encoder else "no reranker"
-        print(f"[RAG] Indexed {len(self.chunks)} child chunks | {rerank_status}.")
+        store = "Qdrant" if self._qdrant is not None else "numpy"
+        print(f"[RAG] Indexed {len(self.chunks)} child chunks | {store} | {rerank_status}.")
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -439,15 +443,20 @@ class RAGSystem:
             self.model.encode(all_queries, normalize_embeddings=True), dtype=np.float32
         )
         for q_vec in query_vecs:
-            q_vec = q_vec.reshape(1, -1)
-            if self.index is not None:
-                scores, indices = self.index.search(q_vec, candidates_k)
-                for s, i in zip(scores[0], indices[0]):
-                    if i >= 0:
-                        # Keep the best score across query variants
-                        dense_scores[int(i)] = max(dense_scores.get(int(i), 0.0), float(s))
+            if self._qdrant is not None:
+                # Qdrant COSINE search — score ∈ [-1, 1], higher is better
+                hits = self._qdrant.search(
+                    collection_name=self._collection_name,
+                    query_vector=q_vec.tolist(),
+                    limit=candidates_k,
+                    with_payload=False,
+                )
+                for hit in hits:
+                    dense_scores[hit.id] = max(dense_scores.get(hit.id, 0.0), hit.score)
             else:
-                raw = np.dot(self.embeddings, q_vec.T).flatten()
+                # numpy dot-product fallback
+                q_2d = q_vec.reshape(1, -1)
+                raw = np.dot(self.embeddings, q_2d.T).flatten()
                 for i in np.argsort(raw)[::-1][:candidates_k]:
                     dense_scores[int(i)] = max(dense_scores.get(int(i), 0.0), float(raw[i]))
 
@@ -515,11 +524,98 @@ class RAGSystem:
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _load_embedding_model(self, model_name: str):
+        """Load embedding model based on EMBEDDING_PROVIDER config.
+
+        Returns a callable ``encode(texts, normalize_embeddings) → np.ndarray``
+        regardless of provider so the rest of the pipeline is unchanged.
+        """
+        provider = config.EMBEDDING_PROVIDER
+
+        if provider == "voyage":
+            return self._make_voyage_encoder()
+        if provider == "openai":
+            return self._make_openai_encoder()
+
+        # Default: local sentence-transformers
         try:
             from sentence_transformers import SentenceTransformer
             return SentenceTransformer(model_name)
         except ImportError:
-            print("[RAG] Warning: sentence-transformers not installed.")
+            print("[RAG] Warning: sentence-transformers not installed. Set AI_EMBEDDING_PROVIDER=voyage or openai to use API instead.")
+            return None
+
+    def _make_voyage_encoder(self):
+        """Return an encoder object wrapping the Voyage AI embeddings API."""
+        try:
+            import voyageai
+        except ImportError:
+            print("[RAG] voyageai package not installed (pip install voyageai). Falling back to local model.")
+            return self._load_local_model(config.EMBEDDING_MODEL)
+
+        key = config.VOYAGE_API_KEY
+        if not key:
+            print("[RAG] VOYAGE_API_KEY not set. Falling back to local model.")
+            return self._load_local_model(config.EMBEDDING_MODEL)
+
+        model_name = config.VOYAGE_EMBEDDING_MODEL
+        client = voyageai.Client(api_key=key)
+
+        class _VoyageEncoder:
+            def encode(self, texts: list[str], normalize_embeddings: bool = True,
+                       show_progress_bar: bool = False) -> np.ndarray:
+                result = client.embed(texts, model=model_name, input_type="document")
+                vecs = np.array(result.embeddings, dtype=np.float32)
+                if normalize_embeddings:
+                    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                    vecs = vecs / np.where(norms == 0, 1, norms)
+                return vecs
+
+        print(f"[RAG] Using Voyage AI embeddings ({model_name}) — no local model download.")
+        return _VoyageEncoder()
+
+    def _make_openai_encoder(self):
+        """Return an encoder object wrapping the OpenAI embeddings API."""
+        try:
+            import openai as _openai
+        except ImportError:
+            print("[RAG] openai package not installed (pip install openai). Falling back to local model.")
+            return self._load_local_model(config.EMBEDDING_MODEL)
+
+        key = config.OPENAI_API_KEY
+        if not key:
+            print("[RAG] OPENAI_API_KEY not set. Falling back to local model.")
+            return self._load_local_model(config.EMBEDDING_MODEL)
+
+        model_name = config.OPENAI_EMBEDDING_MODEL
+        client = _openai.OpenAI(api_key=key)
+
+        class _OpenAIEncoder:
+            def encode(self, texts: list[str], normalize_embeddings: bool = True,
+                       show_progress_bar: bool = False) -> np.ndarray:
+                # OpenAI allows up to 2048 texts per call
+                _BATCH = 512
+                all_vecs: list[np.ndarray] = []
+                for start in range(0, len(texts), _BATCH):
+                    batch = texts[start:start + _BATCH]
+                    resp = client.embeddings.create(input=batch, model=model_name)
+                    batch_vecs = np.array([d.embedding for d in resp.data], dtype=np.float32)
+                    all_vecs.append(batch_vecs)
+                vecs = np.concatenate(all_vecs, axis=0)
+                if normalize_embeddings:
+                    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+                    vecs = vecs / np.where(norms == 0, 1, norms)
+                return vecs
+
+        print(f"[RAG] Using OpenAI embeddings ({model_name}) — no local model download.")
+        return _OpenAIEncoder()
+
+    @staticmethod
+    def _load_local_model(model_name: str):
+        try:
+            from sentence_transformers import SentenceTransformer
+            return SentenceTransformer(model_name)
+        except ImportError:
+            print("[RAG] sentence-transformers not installed.")
             return None
 
     def _load_cross_encoder(self, model_name: str):
@@ -630,14 +726,50 @@ class RAGSystem:
         return None
 
     def _build_index(self):
+        """Build Qdrant local persistent vector index.
+
+        Falls back to numpy dot-product when qdrant-client is not installed.
+        The Qdrant collection is stored inside ``_cache_dir`` so it persists
+        across restarts without a separate Qdrant server.
+        """
         try:
-            import faiss
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import Distance, VectorParams, PointStruct
+
+            os.makedirs(self._cache_dir, exist_ok=True)
+            self._qdrant = QdrantClient(path=self._cache_dir)
             dim = self.embeddings.shape[1]
-            self.index = faiss.IndexFlatIP(dim)
-            self.index.add(self.embeddings)
+
+            # Recreate collection (idempotent for same-hash rebuilds)
+            self._qdrant.recreate_collection(
+                collection_name=self._collection_name,
+                vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            )
+
+            # Batch upsert — Qdrant recommends ~100 points per batch
+            _BATCH = 100
+            for start in range(0, len(self.chunks), _BATCH):
+                end = min(start + _BATCH, len(self.chunks))
+                points = [
+                    PointStruct(
+                        id=i,
+                        vector=self.embeddings[i].tolist(),
+                        payload={
+                            "source": self.chunks[i]["source"],
+                            "chunk_index": self.chunks[i]["chunk_index"],
+                            "header_path": self.chunks[i].get("header_path", ""),
+                        },
+                    )
+                    for i in range(start, end)
+                ]
+                self._qdrant.upsert(collection_name=self._collection_name, points=points)
+
         except ImportError:
-            print("[RAG] FAISS not available, using numpy fallback.")
-            self.index = None
+            print("[RAG] qdrant-client not installed — using numpy dot-product fallback.")
+            self._qdrant = None
+        except Exception as exc:
+            print(f"[RAG] Qdrant init error ({exc}) — using numpy fallback.")
+            self._qdrant = None
 
     def _build_bm25(self):
         try:
