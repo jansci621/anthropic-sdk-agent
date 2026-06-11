@@ -98,6 +98,17 @@ MEMORY_FILE = os.path.join(BASE_DIR, "data", "memories.json")
 KNOWLEDGE_BASE_DIR = os.path.join(BASE_DIR, "knowledge_base")
 SKILLS_DIR = os.environ.get("AI_SKILLS_DIR", os.path.join(BASE_DIR, "skills"))
 
+# ── LLM Wiki Settings ───────────────────────────────────────────────────────
+# Compiled Markdown knowledge layer:
+#   raw/sources/ keeps immutable source snapshots
+#   wiki/ stores source/entity/concept/synthesis pages
+#   graph/ stores the wikilink graph report and JSON
+WIKI_ROOT_DIR = os.environ.get("AI_WIKI_DIR", os.path.join(KNOWLEDGE_BASE_DIR, "wiki"))
+WIKI_RAW_SOURCES_DIR = os.environ.get(
+    "AI_WIKI_RAW_DIR", os.path.join(KNOWLEDGE_BASE_DIR, "raw", "sources")
+)
+WIKI_GRAPH_DIR = os.environ.get("AI_WIKI_GRAPH_DIR", os.path.join(KNOWLEDGE_BASE_DIR, "graph"))
+
 # ── CLAUDE.md ────────────────────────────────────────────────────────────────
 # Project-level CLAUDE.md: global instructions injected into every conversation
 CLAUDE_MD_FILE = os.environ.get("AI_CLAUDE_MD", os.path.join(BASE_DIR, "CLAUDE.md"))
@@ -114,18 +125,28 @@ CHUNK_SIZE = 500       # approximate tokens per chunk
 CHUNK_OVERLAP = 50     # token overlap between chunks
 TOP_K_RESULTS = 3      # number of results to retrieve
 
+# RAG fallback can index Wiki-managed material as well as root knowledge files.
+# This lets search_documents still find sources after wiki_search/wiki_read miss.
+RAG_INCLUDE_WIKI = os.environ.get("AI_RAG_INCLUDE_WIKI", "true").lower() != "false"
+RAG_INCLUDE_RAW_SOURCES = os.environ.get("AI_RAG_INCLUDE_RAW_SOURCES", "true").lower() != "false"
+RAG_REFRESH_AFTER_WIKI_INGEST = os.environ.get("AI_RAG_REFRESH_AFTER_WIKI_INGEST", "true").lower() != "false"
+
 # Qdrant vector store (local persistent mode — no server needed)
 # Set AI_QDRANT_COLLECTION to use a different collection name
 QDRANT_COLLECTION = os.environ.get("AI_QDRANT_COLLECTION", "knowledge_base")
 
 # ── Embedding Provider ───────────────────────────────────────────────────────
-# EMBEDDING_PROVIDER: "local" (sentence-transformers, default),
-#                     "voyage" (Voyage AI API),
-#                     "openai" (OpenAI text-embedding-3-small)
+# EMBEDDING_PROVIDER: "local"  — sentence-transformers (downloads HuggingFace model)
+#                     "voyage" — Voyage AI API (VOYAGE_API_KEY required)
+#                     "openai" — OpenAI-compatible API (OPENAI_API_KEY required)
+#                                Also works with 智谱 embedding-3 via OPENAI_BASE_URL
 # When using an API provider, no HuggingFace model download is needed.
 EMBEDDING_PROVIDER = os.environ.get("AI_EMBEDDING_PROVIDER", "local").lower()
 VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+# Optional: override base URL for OpenAI-compatible providers (e.g. 智谱)
+# OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "")
 # Model names for API providers (override with env vars if needed)
 VOYAGE_EMBEDDING_MODEL = os.environ.get("AI_VOYAGE_MODEL", "voyage-3-lite")
 OPENAI_EMBEDDING_MODEL = os.environ.get("AI_OPENAI_MODEL", "text-embedding-3-small")
@@ -159,15 +180,31 @@ IMPORTANT: "memory" tools store/retrieve **user information and conversation con
 
 Categories: "preference", "fact", "project", "decision", "person", "summary", "instruction", "other"
 
-### 2. System Commands (系统命令)
+### 2. LLM Wiki (编译式知识库)
+You can use a compiled Markdown wiki for durable project/domain knowledge. Prefer this layer before raw RAG when the question is about knowledge already ingested into the local knowledge base.
+
+- **wiki_init**: Initialize the wiki directory model (`raw/sources`, `wiki`, `graph`)
+- **wiki_ingest**: Ingest local files or pasted content into immutable raw snapshots plus source/entity/concept wiki pages
+- **wiki_search**: Search compiled wiki pages first for concepts, entities, decisions, and source summaries
+- **wiki_read**: Read a specific wiki page after search
+- **wiki_health / wiki_lint**: Check missing files, broken links, orphan pages, and index coverage
+- **wiki_graph**: Build/query the wikilink graph and inspect related pages
+
+Wiki vs RAG guidance:
+- Use **wiki_search** before **search_documents** for knowledge-base/domain questions.
+- Use **wiki_read** on the best wiki pages before answering, and cite the page paths/titles.
+- Use **search_documents** as a fallback when the wiki has no useful result or when the user asks about raw files. RAG fallback indexes root knowledge files plus Wiki raw/source pages when enabled by configuration.
+- After using **wiki_ingest**, run **wiki_health** or **wiki_graph** if the user asks to maintain or validate the knowledge base.
+
+### 3. System Commands (系统命令)
 Use **run_command** for checking system resources (CPU, RAM, disk, network) or running local commands.
 
 IMPORTANT: When the user asks about "内存" (memory/RAM), "系统资源", "磁盘", "CPU" etc., use `run_command` — NOT `search_memory`.
 
 - **run_command**: Execute a local shell command (e.g. `systeminfo`, `wmic OS get FreePhysicalMemory`, `df -h`)
 
-### 2. Document Retrieval (RAG)
-You can search through a knowledge base of documents:
+### 4. Document Retrieval (RAG)
+You can search through raw knowledge base documents:
 
 - **search_documents**: Use this when:
   - The user asks questions about topics that might be covered in the knowledge base
@@ -181,7 +218,7 @@ The search returns the most relevant text chunks with source file information. A
 
 1. **Be proactive with memory**: When the user shares personal information, preferences, or important context, save it. Don't wait to be asked.
 2. **Check memory first**: When starting a conversation or answering questions, check if you have relevant stored memories that could help personalize your response.
-3. **Search documents when relevant**: If the user's question might be answered by documents in the knowledge base, search before answering. This provides more accurate, sourced information.
+3. **Search knowledge when relevant**: If the user's question might be answered by the knowledge base, search the compiled wiki first, then fall back to raw RAG documents when needed.
 4. **Think deeply**: Use your extended thinking capability to reason through complex problems step by step before responding.
 5. **Be transparent**: If you use information from memory or documents, mention it naturally in your response.
 6. **Ask clarifying questions**: If you're unsure about something, ask rather than assume.

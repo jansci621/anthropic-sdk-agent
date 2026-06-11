@@ -9,6 +9,7 @@
 - **流式对话** — 实时输出思维过程和回复，支持 adaptive thinking
 - **Web UI** — DeepSeek 风格的 Web 聊天界面，实时展示 Thinking、工具调用和结果（`--web`）
 - **持久化记忆** — 跨会话存储和检索用户偏好、项目信息等
+- **LLM Wiki 编译式知识库** — 将资料摄入为 raw/source/entity/concept 页面，维护 index/log/graph，查询时优先读结构化 Wiki，RAG 兜底
 - **RAG 文档检索** — 本地知识库语义搜索（FAISS 向量 + BM25 稀疏混合检索，支持 .txt/.md/.pdf/.json/.csv，embedding 结果本地缓存）
 - **内置工具** — 文件读写、内容搜索、URL 抓取、Web 搜索、Shell 命令执行
 - **技能系统** — 可热加载/卸载的插件式技能（`+skill` / `-skill`）
@@ -160,6 +161,111 @@ The self-healing system has 7 layers: ...
 [ReAct] Completed in 2 step(s).
 ```
 
+## LLM Wiki 知识库
+
+Agent 内置了轻量 LLM Wiki 层，用于把原始资料编译成可维护的 Markdown 知识库。它不替代 RAG，而是作为优先查询层：先查结构化 Wiki 页面，再在没有命中时回退到 `search_documents`。
+
+降级到 RAG 时，`search_documents` 默认也会索引 Wiki 管理的资料：
+
+- `knowledge_base/raw/sources/`：原始来源快照
+- `knowledge_base/wiki/`：编译后的 source/entity/concept/synthesis 页面
+
+如果觉得编译后的 Wiki 页面会给 RAG 带来噪声，可以设置 `AI_RAG_INCLUDE_WIKI=false`，只保留 raw source 作为 RAG 兜底语料。
+
+如果是在 Agent 运行过程中调用 `wiki_ingest` 摄入新文件，默认会自动重建 RAG 索引，让后续 `search_documents` 立即能检索到新 raw/wiki 内容。大知识库下如果不想每次摄入都重建，可以设置 `AI_RAG_REFRESH_AFTER_WIKI_INGEST=false`，改为重启 Agent 后生效。
+
+### 放入并摄入文档
+
+推荐把待导入资料放到一个单独目录，例如：
+
+```
+knowledge_base/inbox/
+├── runbook.md
+├── design.pdf
+├── product-notes.docx
+└── existing-wiki/
+    └── architecture.md
+```
+
+支持直接摄入：Markdown、文本、JSON、CSV、常见代码文件、PDF、`.docx`。旧版 `.doc` 需要先转换成 `.docx`、`.pdf` 或 `.md`。
+
+初始化并批量摄入：
+
+```bash
+.venv/bin/python wiki_cli.py init --rebuild
+.venv/bin/python wiki_cli.py ingest knowledge_base/inbox
+.venv/bin/python wiki_cli.py health
+```
+
+也可以摄入单个文件：
+
+```bash
+.venv/bin/python wiki_cli.py ingest ./docs/design.pdf --source-type document
+.venv/bin/python wiki_cli.py ingest ./notes/api.md --title "API 设计说明"
+```
+
+摄入完成后启动 Agent：
+
+```bash
+# CLI
+.venv/bin/python main.py
+
+# Web UI
+.venv/bin/python main.py --web --host 127.0.0.1 --port 8000
+```
+
+运行过程中可以直接要求 Agent 使用或维护 Wiki：
+
+```
+在 wiki 里查 VPC 专线不通的排查步骤
+读取 wiki 页面 concepts/xxx.md 并总结
+把 ./docs/new-runbook.md 摄入 wiki
+构建 wiki graph 并检查健康状态
+```
+
+### 目录结构
+
+```
+knowledge_base/
+├── raw/
+│   └── sources/        # 原始来源快照，按 sha256 保留
+├── wiki/
+│   ├── SCHEMA.md       # 页面类型、标签和链接约定
+│   ├── index.md        # 导航索引
+│   ├── log.md          # 摄入和维护日志
+│   ├── overview.md     # 页面统计和最近更新
+│   ├── sources/        # 每个来源的摘要页
+│   ├── entities/       # 实体页：系统、API、产品、组织等
+│   ├── concepts/       # 概念页：架构、方法、决策等
+│   └── syntheses/      # 跨来源分析页
+└── graph/
+    ├── graph.json      # wikilink 图谱
+    └── graph.md        # 图谱报告
+```
+
+### 可用工具
+
+| 工具 | 说明 |
+|------|------|
+| `wiki_init` | 初始化 Wiki 目录、schema、index、log、overview 和 graph |
+| `wiki_ingest` | 摄入本地文件或粘贴内容，写入 raw 快照和 source/entity/concept 页面 |
+| `wiki_search` | 检索编译后的 Wiki 页面 |
+| `wiki_read` | 读取指定 Wiki 页面 |
+| `wiki_health` | 检查初始化状态、断链、孤立页、索引覆盖 |
+| `wiki_lint` | 以 severity 分组输出 health/lint 结果 |
+| `wiki_graph` | 构建图谱、查看图谱报告或查询页面邻居 |
+
+示例对话：
+
+```
+你: 初始化 wiki
+你: 把 README.md 摄入 wiki
+你: 在 wiki 里查 RAG 和 GraphRAG 的关系
+你: 构建 wiki graph 并检查健康状态
+```
+
+当前摄入实现是确定性的两阶段流程：先抽取标题、概念、实体和摘要，再写入页面、重建 index/overview/log/graph。后续可以在 `wiki_system.py` 中接入 LLM 二次编译，不需要改工具协议。
+
 ## 定时任务系统
 
 Agent 内置定时任务调度器，支持通过自然语言创建、管理自动化任务。
@@ -287,6 +393,12 @@ Agent 在运行过程中持续学习和优化：
 | `AI_THINKING` | `true` | 是否启用 extended thinking |
 | `AI_MAX_TOKENS` | `64000` | 最大输出 token 数（过大会显著增加费用，128K ≈ $2-4/call） |
 | `AI_SKILLS_DIR` | `./skills` | 技能目录路径 |
+| `AI_WIKI_DIR` | `./knowledge_base/wiki` | LLM Wiki 页面目录 |
+| `AI_WIKI_RAW_DIR` | `./knowledge_base/raw/sources` | LLM Wiki 原始来源快照目录 |
+| `AI_WIKI_GRAPH_DIR` | `./knowledge_base/graph` | LLM Wiki 图谱输出目录 |
+| `AI_RAG_INCLUDE_RAW_SOURCES` | `true` | RAG 兜底是否索引 Wiki 原始来源快照 |
+| `AI_RAG_INCLUDE_WIKI` | `true` | RAG 兜底是否索引编译后的 Wiki 页面 |
+| `AI_RAG_REFRESH_AFTER_WIKI_INGEST` | `true` | 运行中 `wiki_ingest` 成功后是否自动刷新 RAG 索引 |
 | `AI_AUTO_ROUTE` | `true` | 自动路由（ReAct vs 通用模式） |
 | `AI_ROUTER_MODEL` | 自动 | 路由 LLM 分类器使用的模型（默认为各 provider 最快/最便宜的型号） |
 | `HF_ENDPOINT` | — | HuggingFace 镜像地址（国内可设为 `https://hf-mirror.com`） |
@@ -303,6 +415,8 @@ anthropic-sdk-agent/
 ├── react.py                # ReAct 循环：Thought → Action → Observation
 ├── router.py               # 自动路由：快规则 + LLM 分类器
 ├── memory.py               # 持久化记忆系统
+├── wiki_system.py          # LLM Wiki：raw/wiki/schema、ingest/search/health/graph
+├── wiki_cli.py             # LLM Wiki 批量初始化、摄入、查询、健康检查 CLI
 ├── rag.py                  # RAG 文档检索（FAISS + BM25 混合，V3 语义分块，embedding 缓存）
 ├── scheduler.py            # 定时任务调度器（APScheduler，cron/interval/once，持久化）
 ├── file_tools.py           # 文件操作工具
@@ -320,7 +434,7 @@ anthropic-sdk-agent/
 ├── skills/                 # 可扩展技能目录
 │   ├── base.py             # 技能基类
 │   └── weather/            # 示例：天气技能
-├── knowledge_base/         # RAG 知识库（支持 .md/.txt/.pdf/.json/.csv，索引缓存在 .rag_cache/）
+├── knowledge_base/         # RAG + LLM Wiki 知识库（raw/wiki/graph + .rag_cache/）
 ├── data/                   # 运行时持久化数据
 │   ├── memories.json       # 记忆存储
 │   ├── experiences.json    # 经验存储

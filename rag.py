@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 
@@ -521,6 +522,25 @@ class RAGSystem:
             })
         return results
 
+    def reload(self) -> dict:
+        """Rebuild the RAG corpus from current files without reloading the model."""
+        self.chunks = []
+        self.embeddings = None
+        self._qdrant = None
+        self._bm25 = None
+        self._parent_chunks = {}
+        self._load_and_index()
+        sources = sorted({
+            chunk.get("source", "") for chunk in self.chunks
+            if chunk.get("source")
+        })
+        return {
+            "status": "reloaded",
+            "chunks": len(self.chunks),
+            "sources": len(sources),
+            "sample_sources": sources[:10],
+        }
+
     # ── Internal ─────────────────────────────────────────────────────────
 
     def _load_embedding_model(self, model_name: str):
@@ -587,7 +607,10 @@ class RAGSystem:
             return self._load_local_model(config.EMBEDDING_MODEL)
 
         model_name = config.OPENAI_EMBEDDING_MODEL
-        client = _openai.OpenAI(api_key=key)
+        client_kwargs = {"api_key": key}
+        if config.OPENAI_BASE_URL:
+            client_kwargs["base_url"] = config.OPENAI_BASE_URL
+        client = _openai.OpenAI(**client_kwargs)
 
         class _OpenAIEncoder:
             def encode(self, texts: list[str], normalize_embeddings: bool = True,
@@ -635,23 +658,23 @@ class RAGSystem:
             os.makedirs(self.knowledge_base_dir, exist_ok=True)
             return
 
-        # Read all supported files
+        # Read all supported files. Root knowledge_base files keep the original
+        # non-recursive behavior; Wiki-managed raw/wiki directories are added as
+        # explicit fallback corpora so search_documents can still retrieve them
+        # after wiki_search/wiki_read miss.
         file_contents: dict[str, str] = {}
-        for filename in sorted(os.listdir(self.knowledge_base_dir)):
-            filepath = os.path.join(self.knowledge_base_dir, filename)
-            if not os.path.isfile(filepath):
-                continue
-            ext = os.path.splitext(filename)[1].lower()
+        for source_id, filepath in self._iter_index_files():
+            ext = os.path.splitext(filepath)[1].lower()
             reader = _FILE_READERS.get(ext)
             if reader is None:
                 continue
             try:
                 text = reader(filepath)  # type: ignore[operator]
             except Exception as e:
-                print(f"[RAG] Warning: could not read {filename}: {e}")
+                print(f"[RAG] Warning: could not read {source_id}: {e}")
                 continue
             if text.strip():
-                file_contents[filename] = text
+                file_contents[source_id] = text
 
         if not file_contents:
             return
@@ -702,6 +725,45 @@ class RAGSystem:
         self._build_index()
         self._build_bm25()
         self._save_cache(content_hash)
+
+    def _iter_index_files(self) -> list[tuple[str, str]]:
+        """Return (source_id, filepath) pairs for all RAG-indexable files."""
+        results: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def add_file(source_id: str, filepath: Path):
+            real = str(filepath.resolve())
+            if real in seen:
+                return
+            seen.add(real)
+            results.append((source_id, real))
+
+        kb_root = Path(self.knowledge_base_dir)
+        if kb_root.is_dir():
+            for item in sorted(kb_root.iterdir()):
+                if item.is_file() and item.suffix.lower() in _FILE_READERS:
+                    add_file(item.name, item)
+
+        def add_tree(root_value: str, prefix: str):
+            root = Path(root_value)
+            if not root.is_absolute():
+                root = Path(config.BASE_DIR) / root
+            if not root.is_dir():
+                return
+            for item in sorted(root.rglob("*")):
+                if not item.is_file() or item.suffix.lower() not in _FILE_READERS:
+                    continue
+                if any(part in {".rag_cache", "__pycache__"} for part in item.parts):
+                    continue
+                rel = item.relative_to(root).as_posix()
+                add_file(f"{prefix}/{rel}", item)
+
+        if getattr(config, "RAG_INCLUDE_RAW_SOURCES", True):
+            add_tree(config.WIKI_RAW_SOURCES_DIR, "raw/sources")
+        if getattr(config, "RAG_INCLUDE_WIKI", True):
+            add_tree(config.WIKI_ROOT_DIR, "wiki")
+
+        return results
 
     def _chunk_text_with_size(self, text: str, source_file: str,
                                chunk_size: int) -> list[dict]:

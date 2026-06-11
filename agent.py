@@ -65,6 +65,7 @@ from fast_rules import FastRuleEngine
 from evolution import CoEvolutionCoordinator
 from rag import RAGSystem, RAG_TOOL, handle_rag_tool
 from graph_rag import GraphRAGSystem
+from wiki_system import WikiSystem, WIKI_TOOLS, WIKI_TOOL_NAMES, handle_wiki_tool
 from scheduler import SCHEDULER_TOOLS, handle_scheduler_tool
 from web_tools import WEB_TOOLS, handle_web_tool
 from shell_tools import SHELL_TOOLS, handle_shell_tool
@@ -168,6 +169,7 @@ class Agent:
         # Sub-systems
         self.memory = MemoryStore()
         _noop = _Noop()
+        self.wiki = WikiSystem() if not lightweight else None
         self.rag = RAGSystem() if not lightweight else None
         self.graph_rag = GraphRAGSystem(self.client) if not lightweight else None
         self.repair_agent = RepairAgent(self.client)
@@ -205,11 +207,12 @@ class Agent:
 
         # Tools: base tools + skill scripts
         skill_tools = [t for s in self.skills.values() for t in s.tools]
+        _wiki_tools = WIKI_TOOLS if self.wiki is not None else []
         # RAG tool only available when RAG is loaded (not in lightweight mode)
         _rag_tools = [RAG_TOOL] if self.rag is not None else []
         # GraphRAG tool only available when Neo4j is connected
         _graph_tools = [_GRAPH_SEARCH_TOOL] if (self.graph_rag and self.graph_rag.available) else []
-        self.tools = [*MEMORY_TOOLS, *_rag_tools, *_graph_tools, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
+        self.tools = [*MEMORY_TOOLS, *_wiki_tools, *_rag_tools, *_graph_tools, *SCHEDULER_TOOLS, *FILE_TOOLS, *WEB_TOOLS, *SHELL_TOOLS, *skill_tools]
 
         # System prompt: base + CLAUDE.md + skill prompts + references
         self.system = self._build_system_prompt(system_prompt)
@@ -1609,6 +1612,34 @@ class Agent:
             return handle_scheduler_tool(name, tool_input, session_id=session_id)
         if name in ("save_memory", "search_memory"):
             return handle_memory_tool(name, tool_input, self.memory)
+        if name in WIKI_TOOL_NAMES:
+            if self.wiki is None:
+                return json.dumps({"error": "LLM Wiki not available in lightweight mode"})
+            result = handle_wiki_tool(
+                name,
+                tool_input,
+                self.wiki,
+                workspace_root=self._workspace_dir,
+            )
+            if (
+                name == "wiki_ingest"
+                and self.rag is not None
+                and getattr(config, "RAG_REFRESH_AFTER_WIKI_INGEST", True)
+            ):
+                try:
+                    parsed = json.loads(result)
+                    if isinstance(parsed, dict) and not parsed.get("error"):
+                        parsed["rag_refresh"] = self.rag.reload()
+                        return json.dumps(parsed, ensure_ascii=False)
+                except Exception as exc:
+                    return json.dumps(
+                        {
+                            "wiki_result": result,
+                            "rag_refresh_error": str(exc),
+                        },
+                        ensure_ascii=False,
+                    )
+            return result
         if name == "search_documents":
             if self.rag is None:
                 return json.dumps({"error": "RAG not available in lightweight mode"})
